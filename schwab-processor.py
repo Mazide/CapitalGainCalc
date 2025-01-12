@@ -137,22 +137,22 @@ class RSUProcessor:
         
         for idx, row in equity_df.iterrows():
             if row['SharesSoldWithheldForTaxes'] > 0:
-                # Only process tax sales within the tax year
-                if self.tax_year_start <= row['AwardDate'] <= self.tax_year_end:
-                    shares = row['SharesSoldWithheldForTaxes']
-                    cost_basis_per_share = row['FairMarketValuePrice']
-                    sale_price = row['SalePrice']
-                    
-                    proceeds = shares * sale_price
-                    cost_basis = shares * cost_basis_per_share
-                    gain = proceeds - cost_basis
-                    
-                    print(f"\nVesting {row['AwardDate'].strftime('%d/%m/%Y')}:")
-                    print(f"Received: {row['NetSharesDeposited']:.0f} shares at ${cost_basis_per_share:.2f}")
-                    print(f"Sold for tax: {shares:.0f} shares at ${sale_price:.2f}")
-                    print(f"Gain/Loss: ${gain:.2f}")
-                    print(f"Taxes paid: ${row['Taxes']:.2f}")
-                    
+                shares = row['SharesSoldWithheldForTaxes']
+                cost_basis_per_share = row['FairMarketValuePrice']
+                sale_price = row['SalePrice']
+                
+                proceeds = shares * sale_price
+                cost_basis = shares * cost_basis_per_share
+                gain = proceeds - cost_basis
+                
+                print(f"\nVesting {row['AwardDate'].strftime('%d/%m/%Y')}:")
+                print(f"Received: {row['NetSharesDeposited']:.0f} shares at ${cost_basis_per_share:.2f}")
+                print(f"Sold for tax: {shares:.0f} shares at ${sale_price:.2f}")
+                print(f"Gain/Loss: ${gain:.2f}")
+                print(f"Taxes paid: ${row['Taxes']:.2f}")
+                
+                # Добавляем в итоги только если продажа в текущем налоговом году
+                if self.tax_year_start <= row['AwardDate'] < self.tax_year_end:
                     tax_sales.append({
                         'date': row['AwardDate'].strftime('%Y-%m-%d') if row['AwardDate'] else None,
                         'award_id': row['AwardId'],
@@ -197,58 +197,76 @@ class RSUProcessor:
         vesting_queue.sort(key=lambda x: x['date'])
         
         # Process all sales
+        all_sales = []
         for idx, sale in sales_df.iterrows():
-            # Only process sales within the tax year
-            if self.tax_year_start <= sale['Date'] <= self.tax_year_end:
-                print(f"\nSale {sale['Date'].strftime('%d/%m/%Y')}:")
-                print(f"Selling: {sale['Quantity']:.0f} shares at ${sale['Price']:.2f}")
+            print(f"\nSale {sale['Date'].strftime('%d/%m/%Y')}:")
+            print(f"Selling: {sale['Quantity']:.0f} shares at ${sale['Price']:.2f}")
+            
+            remaining_shares = sale['Quantity']
+            proceeds = 0  # Обнуляем для каждой продажи
+            cost_basis = 0  # Обнуляем для каждой продажи
+            total_gain = 0  # Обнуляем для каждой продажи
+            lots_used = []
+            
+            # Фильтруем вестинги, которые доступны на дату продажи
+            available_vestings = [vest for vest in vesting_queue if vest['date'] <= sale['Date']]
+            
+            while remaining_shares > 0 and available_vestings and available_vestings[0]['shares'] > 0:
+                vest = available_vestings[0]
+                shares_from_lot = min(remaining_shares, vest['shares'])
                 
-                remaining_shares = sale['Quantity']
-                proceeds = sale['Amount']
-                sale_price_per_share = sale['Price']
-                cost_basis = 0
-                lots_used = []
+                lot_proceeds = shares_from_lot * sale['Price']  # Используем цену продажи
+                lot_cost_basis = shares_from_lot * vest['cost_basis']
+                lot_gain = lot_proceeds - lot_cost_basis
                 
-                while remaining_shares > 0 and vesting_queue and vesting_queue[0]['shares'] > 0:
-                    vest = vesting_queue[0]
-                    shares_from_lot = min(remaining_shares, vest['shares'])
-                    
-                    lot_cost_basis = shares_from_lot * vest['cost_basis']
-                    lot_proceeds = shares_from_lot * sale_price_per_share
-                    
-                    print(f"  Used: {shares_from_lot:.0f} shares from {vest['date'].strftime('%d/%m/%Y')} vesting at ${vest['cost_basis']:.2f}")
-                    
-                    lots_used.append({
-                        'award_id': vest['award_id'],
-                        'vesting_date': vest['date'].strftime('%Y-%m-%d') if vest['date'] else None,
-                        'shares': shares_from_lot,
-                        'cost_basis_per_share': vest['cost_basis']
-                    })
-                    
-                    cost_basis += lot_cost_basis
-                    remaining_shares -= shares_from_lot
-                    vest['shares'] -= shares_from_lot
-                    
-                    if vest['shares'] <= 0:
-                        vesting_queue.pop(0)
+                proceeds += lot_proceeds
+                cost_basis += lot_cost_basis
+                total_gain += lot_gain
                 
-                gain = proceeds - cost_basis
-                print(f"  Gain/Loss: ${gain:.2f}")
+                print(f"  Used: {shares_from_lot:.0f} shares from {vest['date'].strftime('%d/%m/%Y')} vesting at ${vest['cost_basis']:.2f} (remaining in lot: {vest['shares'] - shares_from_lot:.0f})")
+                print(f"    Proceeds: ${lot_proceeds:.2f}")
+                print(f"    Cost basis: ${lot_cost_basis:.2f}")
+                print(f"    Lot Gain/Loss: ${lot_gain:.2f}")
                 
+                lots_used.append({
+                    'award_id': vest['award_id'],
+                    'vesting_date': vest['date'].strftime('%Y-%m-%d'),
+                    'shares': shares_from_lot,
+                    'cost_basis_per_share': vest['cost_basis'],
+                    'proceeds': lot_proceeds,
+                    'cost_basis': lot_cost_basis,
+                    'gain': lot_gain,
+                    'remaining_in_lot': vest['shares'] - shares_from_lot
+                })
+                
+                remaining_shares -= shares_from_lot
+                vest['shares'] -= shares_from_lot
+                
+                if vest['shares'] <= 0:
+                    vesting_queue.pop(0)
+                
+            print(f"  Total Gain/Loss: ${total_gain:.2f}")
+            
+            if remaining_shares > 0:
+                print(f"  WARNING: Could not find enough shares for complete sale. {remaining_shares:.0f} shares missing!")
+            
+            # Добавляем продажу в итоги только если она в текущем налоговом году
+            if self.tax_year_start <= sale['Date'] < self.tax_year_end:
                 manual_sales.append({
                     'date': sale['Date'].strftime('%Y-%m-%d') if sale['Date'] else None,
                     'shares': sale['Quantity'],
-                    'sale_price': sale_price_per_share,
+                    'sale_price': sale['Price'],
                     'proceeds': proceeds,
                     'cost_basis': cost_basis,
-                    'gain': gain,
+                    'gain': total_gain,
                     'lots_used': lots_used
                 })
                 
+                # Обновляем общие итоги только для продаж текущего года
                 manual_sales_total['shares'] += sale['Quantity']
                 manual_sales_total['proceeds'] += proceeds
                 manual_sales_total['cost_basis'] += cost_basis
-                manual_sales_total['gain'] += gain
+                manual_sales_total['gain'] += total_gain
         
         total_gain = tax_sales_total['gain'] + manual_sales_total['gain']
         
