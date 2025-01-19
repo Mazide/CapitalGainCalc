@@ -1,354 +1,200 @@
 import pandas as pd
 from datetime import datetime
-import json
-import sys
+from typing import Dict, Optional, Tuple, List
+import os
 from pathlib import Path
 
-class Logger:
-    def __init__(self, filename='capital_gains_calculation.log'):
-        self.terminal = sys.stdout
-        self.log = open(filename, 'w', encoding='utf-8')
-        sys.stdout = self
+class EquityGrant:
+    def __init__(self, award_date: str, award_id: str, fmv: float, sale_price: float, 
+                 shares_sold_for_taxes: int, net_shares: int, taxes: float,
+                 lapse_date: Optional[str] = None, lapse_quantity: Optional[int] = None):
+        self.award_date = award_date
+        self.award_id = award_id
+        self.fmv = fmv
+        self.sale_price = sale_price
+        self.shares_sold_for_taxes = shares_sold_for_taxes
+        self.net_shares = net_shares
+        self.taxes = taxes
+        self.lapse_date = lapse_date
+        self.lapse_quantity = lapse_quantity
 
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
+class Transaction:
+    def __init__(self, date: str, action: str, symbol: str, quantity: str, amount: str, grant: Optional[EquityGrant] = None):
+        transaction_date, vesting_date = parse_dates(date)
+        self.date = pd.to_datetime(transaction_date)
+        self.vesting_date = pd.to_datetime(vesting_date) if vesting_date else None
+        self.action = action
+        self.symbol = symbol
+        self.quantity = int(str(quantity).replace(",", ""))
+        self.amount = float(str(amount).replace("$", "").replace(",", ""))
+        self.grant = grant
+        self.is_tax_sale = grant.shares_sold_for_taxes > 0 if grant else False
+        
+        # Расчет прибыли/убытков
+        self.fmv_total = self.quantity * grant.fmv if grant else 0
+        self.gain = self.amount - self.fmv_total if grant else 0
 
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
+    def __str__(self):
+        base_str = (
+            f"Дата транзакции: {self.date.strftime('%m/%d/%Y')}\n"
+            f"Дата вестинга: {self.vesting_date.strftime('%m/%d/%Y') if self.vesting_date else 'Н/Д'}\n"
+            f"Количество: {self.quantity}\n"
+            f"Сумма продажи: ${self.amount:,.2f}\n"
+        )
+        if self.grant:
+            base_str += (
+                f"FMV на дату вестинга: ${self.grant.fmv:,.2f}\n"
+                f"Общая стоимость по FMV: ${self.fmv_total:,.2f}\n"
+                f"Прибыль/убыток: ${self.gain:,.2f}\n"
+                f"Award ID: {self.grant.award_id}\n"
+                f"Налоговая продажа: {'Да' if self.is_tax_sale else 'Нет'}\n"
+                f"Налог: ${self.grant.taxes:,.2f}"
+            )
+        return base_str
 
-class RSUProcessor:
-    def __init__(self):
-        self.tax_year_start = datetime(2023, 4, 6)
-        self.tax_year_end = datetime(2024, 4, 5)
-    
-    def parse_date(self, date_str):
-        """Parse date from US format, handling 'as of' suffix"""
-        if pd.isna(date_str) or date_str == '':
-            return None
-        try:
-            # Remove any "as of" suffix and trim
-            clean_date = date_str.split(' as of ')[0].strip()
-            return datetime.strptime(clean_date, '%m/%d/%Y')
-        except ValueError as e:
-            print(f"Error parsing date {date_str}: {e}")
-            return None
-    
-    def clean_monetary_value(self, value: str) -> float:
-        """Clean monetary values from symbols"""
-        if pd.isna(value) or value == '':
-            return 0.0
-        return float(str(value).replace('$', '').replace(',', ''))
-    
-    def clean_quantity(self, value: str) -> float:
-        """Clean share quantities"""
-        if pd.isna(value) or value == '':
-            return 0.0
-        return float(str(value).replace(',', ''))
-    
-    def process_equity_data(self, file_path: str) -> pd.DataFrame:
-        """Process RSU data"""
-        print("\n=== Processing RSU Data ===")
-        
-        df = pd.read_csv(file_path)
-        print(f"Loaded {len(df)} records from equity file")
-        
-        # Convert dates
-        date_columns = ['Date', 'AwardDate']
-        for col in date_columns:
-            df[col] = df[col].apply(self.parse_date)
-        
-        # Clean numeric values
-        df['FairMarketValuePrice'] = df['FairMarketValuePrice'].apply(self.clean_monetary_value)
-        df['SalePrice'] = df['SalePrice'].apply(self.clean_monetary_value)
-        df['Taxes'] = df['Taxes'].apply(self.clean_monetary_value)
-        df['SharesSoldWithheldForTaxes'] = df['SharesSoldWithheldForTaxes'].apply(self.clean_quantity)
-        df['NetSharesDeposited'] = df['NetSharesDeposited'].apply(self.clean_quantity)
-        
-        # Filter only records with shares
-        df = df[df['NetSharesDeposited'] > 0].copy()
-        
-        # Sort by date for consistent processing
-        df = df.sort_values('AwardDate')
-        
-        # Log processed vestings
-        print("\nProcessed RSU Vestings:")
-        for idx, row in df.iterrows():
-            print(f"\nVesting {row['AwardDate'].strftime('%d/%m/%Y')}:")
-            print(f"Received: {row['NetSharesDeposited']:.0f} shares at ${row['FairMarketValuePrice']:.2f}")
-            if row['SharesSoldWithheldForTaxes'] > 0:
-                print(f"Sold for tax: {row['SharesSoldWithheldForTaxes']:.0f} shares at ${row['SalePrice']:.2f}")
-                print(f"Taxes paid: ${row['Taxes']:.2f}")
-        
-        return df
-    
-    def process_sales_data(self, file_path: str) -> pd.DataFrame:
-        """Process sales data"""
-        print("\n=== Processing Sales Data ===")
-        
-        df = pd.read_csv(file_path)
-        print(f"Loaded {len(df)} records from sales file")
-        
-        # Convert dates
-        df['Date'] = df['Date'].apply(self.parse_date)
-        
-        # Filter only sales
-        df = df[df['Action'] == 'Sell'].copy()
-        
-        # Clean numeric values
-        df['Price'] = df['Price'].apply(self.clean_monetary_value)
-        df['Amount'] = df['Amount'].apply(self.clean_monetary_value)
-        df['Quantity'] = df['Quantity'].apply(self.clean_quantity)
-        
-        # Sort by date for FIFO
-        df = df.sort_values('Date')
-        
-        # Log all sales chronologically
-        if len(df) > 0:
-            print("\nAll sales in chronological order:")
-            for idx, row in df.iterrows():
-                if pd.notna(row['Date']):  # Only print if date is not NaT
-                    print(f"\nSale {row['Date'].strftime('%d/%m/%Y')}:")
-                    print(f"Sold: {row['Quantity']:.0f} shares at ${row['Price']:.2f}")
-                    print(f"Total amount: ${row['Amount']:.2f}")
-                else:
-                    print(f"\nSale with invalid date:")
-                    print(f"Sold: {row['Quantity']:.0f} shares at ${row['Price']:.2f}")
-                    print(f"Total amount: ${row['Amount']:.2f}")
-        
-        return df
+def parse_dates(date_str: str) -> Tuple[str, Optional[str]]:
+    """Возвращает кортеж (дата_транзакции, дата_вестинга)"""
+    if pd.isna(date_str):
+        return None, None
+    parts = str(date_str).split(' as of ')
+    transaction_date = parts[0]
+    vesting_date = parts[1] if len(parts) > 1 else None
+    return transaction_date, vesting_date
 
-    def calculate_gains(self, equity_df: pd.DataFrame, sales_df: pd.DataFrame) -> dict:
-        """Calculate capital gains"""
-        print("\n=== Calculating Capital Gains ===")
-        
-        # 1. Automatic tax sales
-        print("\nAutomatic Tax Sales:")
-        tax_sales = []
-        tax_sales_total = {
-            'shares': 0,
-            'proceeds': 0,
-            'cost_basis': 0,
-            'gain': 0,
-            'taxes': 0
-        }
-        
-        for idx, row in equity_df.iterrows():
-            if row['SharesSoldWithheldForTaxes'] > 0:
-                shares = row['SharesSoldWithheldForTaxes']
-                cost_basis_per_share = row['FairMarketValuePrice']
-                sale_price = row['SalePrice']
-                
-                proceeds = shares * sale_price
-                cost_basis = shares * cost_basis_per_share
-                gain = proceeds - cost_basis
-                
-                print(f"\nVesting {row['AwardDate'].strftime('%d/%m/%Y')}:")
-                print(f"Received: {row['NetSharesDeposited']:.0f} shares at ${cost_basis_per_share:.2f}")
-                print(f"Sold for tax: {shares:.0f} shares at ${sale_price:.2f}")
-                print(f"Gain/Loss: ${gain:.2f}")
-                print(f"Taxes paid: ${row['Taxes']:.2f}")
-                
-                # Добавляем в итоги только если продажа в текущем налоговом году
-                if self.tax_year_start <= row['AwardDate'] < self.tax_year_end:
-                    tax_sales.append({
-                        'date': row['AwardDate'].strftime('%Y-%m-%d') if row['AwardDate'] else None,
-                        'award_id': row['AwardId'],
-                        'shares': shares,
-                        'cost_basis_per_share': cost_basis_per_share,
-                        'sale_price': sale_price,
-                        'proceeds': proceeds,
-                        'cost_basis': cost_basis,
-                        'gain': gain,
-                        'taxes_paid': row['Taxes']
-                    })
-                    
-                    tax_sales_total['shares'] += shares
-                    tax_sales_total['proceeds'] += proceeds
-                    tax_sales_total['cost_basis'] += cost_basis
-                    tax_sales_total['gain'] += gain
-                    tax_sales_total['taxes'] += row['Taxes']
-        
-        # 2. Manual sales
-        print("\nManual Sales:")
-        manual_sales = []
-        manual_sales_total = {
-            'shares': 0,
-            'proceeds': 0,
-            'cost_basis': 0,
-            'gain': 0
-        }
-        
-        # Create FIFO vesting queue
-        vesting_queue = []
-        for idx, row in equity_df.iterrows():
-            if row['NetSharesDeposited'] > 0:
-                vest = {
-                    'date': row['AwardDate'],
-                    'award_id': row['AwardId'],
-                    'shares': row['NetSharesDeposited'],
-                    'cost_basis': row['FairMarketValuePrice']
-                }
-                vesting_queue.append(vest)
-        
-        # Sort vestings by date (ensuring FIFO)
-        vesting_queue.sort(key=lambda x: x['date'])
-        
-        # Process all sales
-        all_sales = []
-        for idx, sale in sales_df.iterrows():
-            print(f"\nSale {sale['Date'].strftime('%d/%m/%Y')}:")
-            print(f"Selling: {sale['Quantity']:.0f} shares at ${sale['Price']:.2f}")
+def load_equity_data(filename: str) -> List[EquityGrant]:
+    df = pd.read_csv(filename)
+    grants = []
+    
+    current_lapse_date = None
+    current_lapse_quantity = None
+    
+    # Сортируем DataFrame по дате, но сохраняем порядок строк для каждой даты
+    for _, row in df.iterrows():
+        # Пропускаем строки с операцией Journal
+        print(row)
+        if pd.notna(row['Action']) and row['Action'] == 'Journal':
+            continue
             
-            remaining_shares = sale['Quantity']
-            proceeds = 0  # Обнуляем для каждой продажи
-            cost_basis = 0  # Обнуляем для каждой продажи
-            total_gain = 0  # Обнуляем для каждой продажи
-            lots_used = []
+        if pd.notna(row['Date']) and pd.notna(row['Action']) and row['Action'] == 'Lapse':  # Строка с датой и Lapse
+            current_lapse_date = row['Date']
+            current_lapse_quantity = int(float(str(row['Quantity']).replace(',', ''))) if pd.notna(row['Quantity']) else None
+        elif pd.notna(row['AwardId']) and current_lapse_date and current_lapse_quantity:  # Строка с деталями гранта
+            grant = EquityGrant(
+                award_date=row['AwardDate'],
+                award_id=row['AwardId'],
+                fmv=float(str(row['FairMarketValuePrice']).replace('$', '')),
+                sale_price=float(str(row['SalePrice']).replace('$', '')),
+                shares_sold_for_taxes=int(float(str(row['SharesSoldWithheldForTaxes']).replace(',', ''))) if pd.notna(row['SharesSoldWithheldForTaxes']) else 0,
+                net_shares=int(float(str(row['NetSharesDeposited']).replace(',', ''))) if pd.notna(row['NetSharesDeposited']) else 0,
+                taxes=float(str(row['Taxes']).replace('$', '').replace(',', '')) if pd.notna(row['Taxes']) else 0.0,
+                lapse_date=current_lapse_date,  # Добавляем информацию из предыдущей строки
+                lapse_quantity=current_lapse_quantity  # Добавляем информацию из предыдущей строки
+            )
+            grants.append(grant)
             
-            # Фильтруем вестинги, которые доступны на дату продажи
-            available_vestings = [vest for vest in vesting_queue if vest['date'] <= sale['Date']]
-            
-            while remaining_shares > 0 and available_vestings and available_vestings[0]['shares'] > 0:
-                vest = available_vestings[0]
-                shares_from_lot = min(remaining_shares, vest['shares'])
-                
-                lot_proceeds = shares_from_lot * sale['Price']  # Используем цену продажи
-                lot_cost_basis = shares_from_lot * vest['cost_basis']
-                lot_gain = lot_proceeds - lot_cost_basis
-                
-                proceeds += lot_proceeds
-                cost_basis += lot_cost_basis
-                total_gain += lot_gain
-                
-                print(f"  Used: {shares_from_lot:.0f} shares from {vest['date'].strftime('%d/%m/%Y')} vesting at ${vest['cost_basis']:.2f} (remaining in lot: {vest['shares'] - shares_from_lot:.0f})")
-                print(f"    Proceeds: ${lot_proceeds:.2f}")
-                print(f"    Cost basis: ${lot_cost_basis:.2f}")
-                print(f"    Lot Gain/Loss: ${lot_gain:.2f}")
-                
-                lots_used.append({
-                    'award_id': vest['award_id'],
-                    'vesting_date': vest['date'].strftime('%Y-%m-%d'),
-                    'shares': shares_from_lot,
-                    'cost_basis_per_share': vest['cost_basis'],
-                    'proceeds': lot_proceeds,
-                    'cost_basis': lot_cost_basis,
-                    'gain': lot_gain,
-                    'remaining_in_lot': vest['shares'] - shares_from_lot
-                })
-                
-                remaining_shares -= shares_from_lot
-                vest['shares'] -= shares_from_lot
-                
-                if vest['shares'] <= 0:
-                    vesting_queue.pop(0)
-                
-            print(f"  Total Gain/Loss: ${total_gain:.2f}")
-            
-            if remaining_shares > 0:
-                print(f"  WARNING: Could not find enough shares for complete sale. {remaining_shares:.0f} shares missing!")
-            
-            # Добавляем продажу в итоги только если она в текущем налоговом году
-            if self.tax_year_start <= sale['Date'] < self.tax_year_end:
-                manual_sales.append({
-                    'date': sale['Date'].strftime('%Y-%m-%d') if sale['Date'] else None,
-                    'shares': sale['Quantity'],
-                    'sale_price': sale['Price'],
-                    'proceeds': proceeds,
-                    'cost_basis': cost_basis,
-                    'gain': total_gain,
-                    'lots_used': lots_used
-                })
-                
-                # Обновляем общие итоги только для продаж текущего года
-                manual_sales_total['shares'] += sale['Quantity']
-                manual_sales_total['proceeds'] += proceeds
-                manual_sales_total['cost_basis'] += cost_basis
-                manual_sales_total['gain'] += total_gain
-        
-        total_gain = tax_sales_total['gain'] + manual_sales_total['gain']
-        
-        return {
-            'tax_sales': {
-                'details': tax_sales,
-                'summary': tax_sales_total
-            },
-            'manual_sales': {
-                'details': manual_sales,
-                'summary': manual_sales_total
-            },
-            'total_gain': total_gain
-        }
+            # Сбрасываем значения lapse после создания гранта
+            current_lapse_date = None
+            current_lapse_quantity = None
     
-    def print_report(self, results: dict):
-        """Print final report"""
-        print(f"\n=== Capital Gains Report {self.tax_year_start.year}-{self.tax_year_end.year} ===")
-        print(f"Tax year: {self.tax_year_start.strftime('%d/%m/%Y')} - {self.tax_year_end.strftime('%d/%m/%Y')}")
-        
-        # Automatic tax sales
-        tax = results['tax_sales']['summary']
-        print("\nAutomatic Tax Sales:")
-        print(f"Shares sold: {tax['shares']:.0f}")
-        print(f"Proceeds: ${tax['proceeds']:,.2f}")
-        print(f"Cost basis: ${tax['cost_basis']:,.2f}")
-        print(f"Gain/Loss: ${tax['gain']:,.2f}")
-        print(f"Taxes paid: ${tax['taxes']:,.2f}")
-        
-        # Manual sales
-        manual = results['manual_sales']['summary']
-        print("\nManual Sales:")
-        print(f"Shares sold: {manual['shares']:.0f}")
-        print(f"Proceeds: ${manual['proceeds']:,.2f}")
-        print(f"Cost basis: ${manual['cost_basis']:,.2f}")
-        print(f"Gain/Loss: ${manual['gain']:,.2f}")
-        
-        # Total results
-        print("\nTotal Results:")
-        print(f"Total Gain/Loss: ${results['total_gain']:,.2f}")
-        
-        # Save detailed report
-        with open('reports/capital_gains_details.json', 'w') as f:
-            json.dump(results, f, indent=2)
-        print("\nDetailed report saved to 'capital_gains_details.json'")
+    return grants
 
-def main():
-    try:
-        # Create reports directory if it doesn't exist
-        Path("reports").mkdir(exist_ok=True)
+def load_transactions(filename: str, equity_data: List[EquityGrant]) -> List[Transaction]:
+    """Загружает транзакции из CSV файла и сопоставляет их с грантами акций."""
+    df = pd.read_csv(filename)
+    transactions = []
+    
+    # Сортируем DataFrame по дате
+    df = df.sort_values(by='Date', ascending=True)
+    
+    # Группируем транзакции по дате для сопоставления с грантами
+    date_quantity_map = {}
+    
+    for _, row in df.iterrows():
+        if pd.isna(row['Date']) or pd.isna(row['Action']):
+            continue
+            
+        date = row['Date']
+        action = row['Action']
         
-        # Initialize logger
-        logger = Logger('reports/calculation_details.log')
+        # Обрабатываем только продажи и получение акций
+        if action not in ['Sell', 'Stock Plan Activity']:
+            continue
+            
+        quantity = row['Quantity'] if pd.notna(row['Quantity']) else 0
+        amount = row['Amount'] if pd.notna(row['Amount']) else 0
         
-        print("=== Starting Capital Gains Calculation ===")
-        print(f"Date and time: {datetime.now()}\n")
+        # Для Stock Plan Activity сохраняем количество акций
+        if action == 'Stock Plan Activity':
+            date_quantity_map[(date, str(quantity))] = True
+            continue
+            
+        # Для продаж ищем соответствующий грант
+        grant = next((g for g in equity_data 
+                     if g.lapse_date == date and str(g.net_shares + g.shares_sold_for_taxes) == str(quantity)), 
+                    None)
         
-        processor = RSUProcessor()
-        
-        # Process files
-        equity_df = processor.process_equity_data('equity.csv')
-        sales_df = processor.process_sales_data('history.csv')
-        
-        # Calculate gains
-        results = processor.calculate_gains(equity_df, sales_df)
-        
-        # Print report
-        processor.print_report(results)
-        
-        # Save results as JSON
-        with open('reports/capital_gains_results.json', 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        print("\nAll files saved in 'reports' directory:")
-        print("1. calculation_details.log - Detailed calculation log")
-        print("2. capital_gains_results.json - Results in JSON format")
-        
-    except Exception as e:
-        print(f"\nError: {str(e)}")
-        raise
-    finally:
-        sys.stdout = sys.__stdout__
+        transaction = Transaction(
+            date=date,
+            action=action,
+            symbol=row['Symbol'],
+            quantity=quantity,
+            amount=amount,
+            grant=grant
+        )
+        transactions.append(transaction)
+    
+    return transactions
 
-if __name__ == "__main__":
-    main()
+def process_transactions_chronologically(history_file: str, equity_file: str, output_file):
+    """
+    Обрабатывает транзакции и гранты в хронологическом порядке.
+    """
+    equity_data = load_equity_data(equity_file)
+    transactions = load_transactions(history_file, equity_data)
+    
+    # Для каждой транзакции ищем соответствующий грант
+    for transaction in transactions:
+        if transaction.action == 'Sell':
+            transaction_date = transaction.date
+            # Ищем соответствующий грант
+            matching_grant = None
+            for grant in equity_data:
+                grant_date = pd.to_datetime(grant.lapse_date)
+                # Проверяем совпадение даты (тот же день или предыдущий)
+                dates_match = (grant_date == transaction_date) or (grant_date == transaction_date - pd.Timedelta(days=1))
+                # Проверяем, соответствует ли количество проданных акций налоговой продаже
+                if dates_match and grant.shares_sold_for_taxes == transaction.quantity:
+                    transaction.grant = grant
+                    transaction.is_tax_sale = True
+                    break
+    
+    # Выводим транзакции
+    for transaction in transactions:
+        print(f"\nДата: {transaction.date.strftime('%m/%d/%Y')}", file=output_file)
+        print("-" * 50, file=output_file)
+        print("Тип: Транзакция", file=output_file)
+        print(f"Количество акций: {transaction.quantity}", file=output_file)
+        print(f"Налоговая продажа: {'Да' if transaction.is_tax_sale else 'Нет'}", file=output_file)
+        print(f"Цена продажи: ${transaction.amount/transaction.quantity:,.2f}", file=output_file)
+        if transaction.grant:
+            print(f"Цена вестинга (FMV): ${transaction.grant.fmv:,.2f}", file=output_file)
+        print("-" * 50, file=output_file)
+
+def build_report(history_file: str, equity_file: str):
+    """
+    Строит отчет по транзакциям с акциями, загружая данные из файлов истории и грантов.
+    """
+    # Создаем директорию reports если она не существует
+    os.makedirs('reports', exist_ok=True)
+    
+    # Генерируем имя файла с текущей датой и временем
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_file = f'reports/equity_report_{timestamp}.txt'
+    
+    with open(report_file, 'w', encoding='utf-8') as f:
+        process_transactions_chronologically(history_file, equity_file, f)
+        
+    
+    print(f"Отчет сохранен в файл: {report_file}")
+
+build_report('history.csv', 'equity.csv')
