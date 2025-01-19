@@ -20,36 +20,49 @@ class EquityGrant:
         self.lapse_quantity = lapse_quantity
 
 class Transaction:
-    def __init__(self, date: str, action: str, symbol: str, quantity: str, amount: str, grant: Optional[EquityGrant] = None):
+    def __init__(self, date: str, action: str, symbol: str, quantity: str, amount: str, 
+                 exchange_rates: pd.DataFrame, grant: Optional[EquityGrant] = None):
         transaction_date, vesting_date = parse_dates(date)
         self.date = pd.to_datetime(transaction_date)
         self.vesting_date = pd.to_datetime(vesting_date) if vesting_date else None
         self.action = action
         self.symbol = symbol
         self.quantity = int(float(str(quantity).replace(",", "")))
-        self.amount = float(str(amount).replace("$", "").replace(",", ""))
+        
+        # Convert amount from USD to GBP
+        usd_amount = float(str(amount).replace("$", "").replace(",", ""))
+        self.exchange_rate = self._get_exchange_rate(exchange_rates)
+        self.amount = usd_amount * self.exchange_rate
+        
         self.grant = grant
         self.is_tax_sale = grant.shares_sold_for_taxes > 0 if grant else False
         
-        # Calculate profit/loss
-        self.fmv_total = self.quantity * grant.fmv if grant else 0
+        # Calculate profit/loss in GBP
+        self.fmv_total = (self.quantity * grant.fmv * self.exchange_rate) if grant else 0
         self.gain = self.amount - self.fmv_total if grant else 0
+
+    def _get_exchange_rate(self, exchange_rates: pd.DataFrame) -> float:
+        """Get the exchange rate for the transaction date"""
+        # Find the closest date that's not after our transaction date
+        closest_date = exchange_rates.index[exchange_rates.index <= self.date].max()
+        return exchange_rates.loc[closest_date, 'usd_gbp_rate']
 
     def __str__(self):
         base_str = (
             f"Transaction Date: {self.date.strftime('%m/%d/%Y')}\n"
             f"Vesting Date: {self.vesting_date.strftime('%m/%d/%Y') if self.vesting_date else 'N/A'}\n"
             f"Quantity: {self.quantity}\n"
-            f"Sale Amount: ${self.amount:,.2f}\n"
+            f"Exchange Rate: {self.exchange_rate:.4f}\n"
+            f"Sale Amount: £{self.amount:,.2f}\n"
         )
         if self.grant:
             base_str += (
-                f"FMV at Vest: ${self.grant.fmv:,.2f}\n"
-                f"Total FMV Value: ${self.fmv_total:,.2f}\n"
-                f"Gain/Loss: ${self.gain:,.2f}\n"
+                f"FMV at Vest: £{(self.grant.fmv * self.exchange_rate):,.2f}\n"
+                f"Total FMV Value: £{self.fmv_total:,.2f}\n"
+                f"Gain/Loss: £{self.gain:,.2f}\n"
                 f"Award ID: {self.grant.award_id}\n"
                 f"Tax Sale: {'Yes' if self.is_tax_sale else 'No'}\n"
-                f"Tax Amount: ${self.grant.taxes:,.2f}"
+                f"Tax Amount: £{(self.grant.taxes * self.exchange_rate):,.2f}"
             )
         return base_str
 
@@ -97,7 +110,14 @@ def load_equity_data(filename: str) -> List[EquityGrant]:
     
     return grants
 
-def load_transactions(filename: str, equity_data: List[EquityGrant]) -> List[Transaction]:
+def load_exchange_rates(filename: str) -> pd.DataFrame:
+    """Load exchange rates from CSV file and return as DataFrame indexed by date"""
+    rates_df = pd.read_csv(filename)
+    rates_df['date'] = pd.to_datetime(rates_df['date'])
+    rates_df.set_index('date', inplace=True)
+    return rates_df
+
+def load_transactions(filename: str, equity_data: List[EquityGrant], exchange_rates: pd.DataFrame) -> List[Transaction]:
     """Load transactions from CSV file and match them with equity grants."""
     df = pd.read_csv(filename)
     transactions = []
@@ -132,6 +152,7 @@ def load_transactions(filename: str, equity_data: List[EquityGrant]) -> List[Tra
             symbol=row['Symbol'],
             quantity=quantity,
             amount=amount,
+            exchange_rates=exchange_rates,
             grant=grant
         )
         transactions.append(transaction)
@@ -242,10 +263,11 @@ def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Secti
             print(f"  Profit/Loss: £{rg.gain:,.2f}", file=f)
             print("-" * 80, file=f)
 
-def process_transactions_chronologically(history_file: str, equity_file: str, output_dir: str):
+def process_transactions_chronologically(history_file: str, equity_file: str, exchange_rates_file: str, output_dir: str):
     """Process transactions and grants in chronological order."""
     equity_data = load_equity_data(equity_file)
-    transactions = load_transactions(history_file, equity_data)
+    exchange_rates = load_exchange_rates(exchange_rates_file)
+    transactions = load_transactions(history_file, equity_data, exchange_rates)
     
     # Create operations list
     operations = []
@@ -255,12 +277,15 @@ def process_transactions_chronologically(history_file: str, equity_file: str, ou
         if grant.lapse_date:
             lapse_date = pd.to_datetime(grant.lapse_date)
             total_shares = grant.net_shares + grant.shares_sold_for_taxes
+            # Get exchange rate for the lapse date
+            closest_date = exchange_rates.index[exchange_rates.index <= lapse_date].max()
+            exchange_rate = exchange_rates.loc[closest_date, 'usd_gbp_rate']
             operations.append(Operation(
                 date=lapse_date,
                 action='BUY',
-                symbol='RSU',  # or use actual symbol
+                symbol='RSU',
                 quantity=total_shares,
-                price=grant.fmv
+                price=grant.fmv * exchange_rate  # Convert FMV to GBP
             ))
     
     # Add sales (SELL)
@@ -323,14 +348,14 @@ def process_transactions_chronologically(history_file: str, equity_file: str, ou
         print(f"Total Pool Cost: £{pool.total_cost:,.2f}", file=f)
         print(f"Average Share Cost: £{pool.average_price:,.2f}", file=f)
 
-def build_report(history_file: str, equity_file: str):
+def build_report(history_file: str, equity_file: str, exchange_rates_file: str):
     """Build a report of stock transactions by loading data from history and equity files."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     base_dir = os.path.join('reports', f'equity_report_{timestamp}')
     os.makedirs(base_dir, exist_ok=True)
     
-    process_transactions_chronologically(history_file, equity_file, base_dir)
+    process_transactions_chronologically(history_file, equity_file, exchange_rates_file, base_dir)
     
     print(f"Reports generated in directory: {base_dir}")
 
-build_report('history.csv', 'equity.csv')
+build_report('history.csv', 'equity.csv', 'exchange_rates.csv')
