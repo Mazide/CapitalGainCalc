@@ -4,6 +4,11 @@ from typing import Dict, Optional, Tuple, List
 import os
 from pathlib import Path
 from collections import defaultdict
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
 
 class EquityGrant:
     def __init__(self, award_date: str, award_id: str, fmv: float, sale_price: float, 
@@ -201,10 +206,145 @@ def get_uk_tax_year(date: datetime) -> int:
     return year - 1 if date <= cutoff else year
 
 def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Section104Pool, base_dir: str):
-    """Write detailed report for a specific tax year"""
-    report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
+    """Write detailed report for a specific tax year in both TXT and PDF formats"""
+    # Создаем базовые стили для PDF
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=16,
+        spaceAfter=30
+    )
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        spaceAfter=20
+    )
+    normal_style = styles['Normal']
+    
+    # Создаем PDF документ
+    pdf_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.pdf')
+    doc = SimpleDocTemplate(
+        pdf_file,
+        pagesize=A4,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=72,
+        bottomMargin=72
+    )
+    
+    # Подготавливаем элементы для PDF
+    elements = []
+    
+    # Заголовок
+    elements.append(Paragraph(f"CAPITAL GAINS REPORT FOR TAX YEAR {year}-{year+1}", title_style))
+    elements.append(Spacer(1, 20))
     
     year_gains = [rg for rg in realized_gains if get_uk_tax_year(rg.date) == year]
+    
+    # Месячная сводка
+    elements.append(Paragraph("MONTHLY BREAKDOWN", heading_style))
+    
+    monthly_summary = defaultdict(lambda: {'gains': 0.0, 'shares': 0, 'transactions': 0})
+    for rg in year_gains:
+        month = rg.date.strftime('%B %Y')
+        monthly_summary[month]['gains'] += rg.gain
+        monthly_summary[month]['shares'] += rg.quantity
+        monthly_summary[month]['transactions'] += 1
+    
+    # Создаем таблицу для месячной сводки
+    monthly_data = [['Month', 'Trades', 'Shares', 'Profit/Loss']]
+    for month, data in sorted(monthly_summary.items()):
+        monthly_data.append([
+            month,
+            str(data['transactions']),
+            f"{data['shares']:,}",
+            f"£{data['gains']:,.2f}"
+        ])
+    
+    monthly_table = Table(monthly_data, colWidths=[120, 80, 100, 120])
+    monthly_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+        ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
+    ]))
+    
+    elements.append(monthly_table)
+    elements.append(Spacer(1, 20))
+    
+    # Годовая сводка
+    elements.append(Paragraph("YEAR SUMMARY", heading_style))
+    
+    total_proceeds = sum(rg.proceeds for rg in year_gains)
+    total_cost = sum(rg.cost for rg in year_gains)
+    total_gain = sum(rg.gain for rg in year_gains)
+    total_shares = sum(rg.quantity for rg in year_gains)
+    
+    summary_data = [
+        ['Total Transactions:', f"{len(year_gains)}"],
+        ['Total Shares Sold:', f"{total_shares:,}"],
+        ['Total Proceeds:', f"£{total_proceeds:,.2f}"],
+        ['Total Cost Basis:', f"£{total_cost:,.2f}"],
+        ['Net Capital Gain:', f"£{total_gain:,.2f}"]
+    ]
+    
+    if total_shares > 0:
+        summary_data.append(['Average Gain per Share:', f"£{(total_gain/total_shares):,.2f}"])
+    
+    summary_table = Table(summary_data, colWidths=[150, 200])
+    summary_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+    ]))
+    
+    elements.append(summary_table)
+    elements.append(Spacer(1, 20))
+    
+    # Детальные транзакции
+    elements.append(Paragraph("DETAILED TRANSACTIONS", heading_style))
+    
+    for rg in year_gains:
+        transaction_data = [
+            ['Date:', rg.date.strftime('%d %B %Y')],
+            ['Shares Sold:', f"{rg.quantity:,}"],
+            ['Sale Price per Share:', f"£{(rg.proceeds/rg.quantity):,.2f}"],
+            ['Cost Basis per Share:', f"£{(rg.cost/rg.quantity):,.2f}"],
+            ['Profit per Share:', f"£{((rg.proceeds-rg.cost)/rg.quantity):,.2f}"],
+            ['Total Proceeds:', f"£{rg.proceeds:,.2f}"],
+            ['Total Cost Basis:', f"£{rg.cost:,.2f}"],
+            ['Total Profit/Loss:', f"£{rg.gain:,.2f}"]
+        ]
+        
+        transaction_table = Table(transaction_data, colWidths=[150, 200])
+        transaction_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ]))
+        
+        elements.append(transaction_table)
+        elements.append(Spacer(1, 20))
+    
+    # Генерируем PDF
+    doc.build(elements)
+    
+    # Также сохраняем текстовый файл (оставляем существующий код)
+    report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
     
     with open(report_file, 'w', encoding='utf-8') as f:
         print(f"CAPITAL GAINS REPORT FOR TAX YEAR {year}-{year+1}", file=f)
