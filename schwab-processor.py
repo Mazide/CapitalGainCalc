@@ -29,23 +29,23 @@ class Transaction:
         self.symbol = symbol
         self.quantity = int(float(str(quantity).replace(",", "")))
         
-        # Convert amount from USD to GBP
+        # Convert amount from USD to GBP using GBP/USD rate
         usd_amount = float(str(amount).replace("$", "").replace(",", ""))
         self.exchange_rate = self._get_exchange_rate(exchange_rates)
-        self.amount = usd_amount * self.exchange_rate
+        self.amount = usd_amount / self.exchange_rate  # Changed from multiplication to division
         
         self.grant = grant
         self.is_tax_sale = grant.shares_sold_for_taxes > 0 if grant else False
         
         # Calculate profit/loss in GBP
-        self.fmv_total = (self.quantity * grant.fmv * self.exchange_rate) if grant else 0
+        self.fmv_total = (self.quantity * grant.fmv / self.exchange_rate) if grant else 0  # Changed from multiplication to division
         self.gain = self.amount - self.fmv_total if grant else 0
 
     def _get_exchange_rate(self, exchange_rates: pd.DataFrame) -> float:
         """Get the exchange rate for the transaction date"""
         # Find the closest date that's not after our transaction date
         closest_date = exchange_rates.index[exchange_rates.index <= self.date].max()
-        return exchange_rates.loc[closest_date, 'usd_gbp_rate']
+        return exchange_rates.loc[closest_date, 'gbp_usd_rate']  # Changed column name
 
     def __str__(self):
         base_str = (
@@ -57,12 +57,12 @@ class Transaction:
         )
         if self.grant:
             base_str += (
-                f"FMV at Vest: £{(self.grant.fmv * self.exchange_rate):,.2f}\n"
+                f"FMV at Vest: £{(self.grant.fmv / self.exchange_rate):,.2f}\n"
                 f"Total FMV Value: £{self.fmv_total:,.2f}\n"
                 f"Gain/Loss: £{self.gain:,.2f}\n"
                 f"Award ID: {self.grant.award_id}\n"
                 f"Tax Sale: {'Yes' if self.is_tax_sale else 'No'}\n"
-                f"Tax Amount: £{(self.grant.taxes * self.exchange_rate):,.2f}"
+                f"Tax Amount: £{(self.grant.taxes / self.exchange_rate):,.2f}"
             )
         return base_str
 
@@ -202,10 +202,7 @@ def get_uk_tax_year(date: datetime) -> int:
 
 def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Section104Pool, base_dir: str):
     """Write detailed report for a specific tax year"""
-    year_dir = os.path.join(base_dir, f'tax_year_{year}_{year+1}')
-    os.makedirs(year_dir, exist_ok=True)
-    
-    report_file = os.path.join(year_dir, f'capital_gains_report.txt')
+    report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
     
     year_gains = [rg for rg in realized_gains if get_uk_tax_year(rg.date) == year]
     
@@ -279,13 +276,13 @@ def process_transactions_chronologically(history_file: str, equity_file: str, ex
             total_shares = grant.net_shares + grant.shares_sold_for_taxes
             # Get exchange rate for the lapse date
             closest_date = exchange_rates.index[exchange_rates.index <= lapse_date].max()
-            exchange_rate = exchange_rates.loc[closest_date, 'usd_gbp_rate']
+            exchange_rate = exchange_rates.loc[closest_date, 'gbp_usd_rate']
             operations.append(Operation(
                 date=lapse_date,
                 action='BUY',
                 symbol='RSU',
                 quantity=total_shares,
-                price=grant.fmv * exchange_rate  # Convert FMV to GBP
+                price=grant.fmv / exchange_rate  # Changed from multiplication to division
             ))
     
     # Add sales (SELL)
@@ -350,8 +347,7 @@ def process_transactions_chronologically(history_file: str, equity_file: str, ex
 
 def build_report(history_file: str, equity_file: str, exchange_rates_file: str):
     """Build a report of stock transactions by loading data from history and equity files."""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    base_dir = os.path.join('reports', f'equity_report_{timestamp}')
+    base_dir = 'reports'
     os.makedirs(base_dir, exist_ok=True)
     
     process_transactions_chronologically(history_file, equity_file, exchange_rates_file, base_dir)
