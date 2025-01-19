@@ -26,7 +26,7 @@ class Transaction:
         self.vesting_date = pd.to_datetime(vesting_date) if vesting_date else None
         self.action = action
         self.symbol = symbol
-        self.quantity = int(str(quantity).replace(",", ""))
+        self.quantity = int(float(str(quantity).replace(",", "")))
         self.amount = float(str(amount).replace("$", "").replace(",", ""))
         self.grant = grant
         self.is_tax_sale = grant.shares_sold_for_taxes > 0 if grant else False
