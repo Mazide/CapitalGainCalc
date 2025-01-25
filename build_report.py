@@ -1,9 +1,9 @@
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, List
 import os
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -34,16 +34,16 @@ class Transaction:
         self.symbol = symbol
         self.quantity = int(float(str(quantity).replace(",", "")))
         
-        # Convert amount from USD to GBP using GBP/USD rate
+        # Конвертация суммы из USD в GBP
         usd_amount = float(str(amount).replace("$", "").replace(",", ""))
         self.exchange_rate = self._get_exchange_rate(exchange_rates)
-        self.amount = usd_amount / self.exchange_rate  # Changed from multiplication to division
+        self.amount = usd_amount * (1 / self.exchange_rate)  # USD в GBP: умножаем на обратный курс
         
         self.grant = grant
         self.is_tax_sale = grant.shares_sold_for_taxes > 0 if grant else False
         
-        # Calculate profit/loss in GBP
-        self.fmv_total = (self.quantity * grant.fmv / self.exchange_rate) if grant else 0  # Changed from multiplication to division
+        # Расчет FMV в GBP
+        self.fmv_total = (self.quantity * grant.fmv * (1 / self.exchange_rate)) if grant else 0  # USD в GBP
         self.gain = self.amount - self.fmv_total if grant else 0
 
     def _get_exchange_rate(self, exchange_rates: pd.DataFrame) -> float:
@@ -62,12 +62,12 @@ class Transaction:
         )
         if self.grant:
             base_str += (
-                f"FMV at Vest: £{(self.grant.fmv / self.exchange_rate):,.2f}\n"
+                f"FMV at Vest: £{(self.grant.fmv * (1 / self.exchange_rate)):,.2f}\n"
                 f"Total FMV Value: £{self.fmv_total:,.2f}\n"
                 f"Gain/Loss: £{self.gain:,.2f}\n"
                 f"Award ID: {self.grant.award_id}\n"
                 f"Tax Sale: {'Yes' if self.is_tax_sale else 'No'}\n"
-                f"Tax Amount: £{(self.grant.taxes / self.exchange_rate):,.2f}"
+                f"Tax Amount: £{(self.grant.taxes * (1 / self.exchange_rate)):,.2f}"
             )
         return base_str
 
@@ -186,304 +186,372 @@ class Section104Pool:
 class Operation:
     def __init__(self, date: datetime, action: str, symbol: str, quantity: int, price: float):
         self.date = date
-        self.action = action  # 'BUY' or 'SELL'
+        self.action = action  # 'BUY' или 'SELL'
         self.symbol = symbol
         self.quantity = quantity
         self.price = price
 
 class RealizedGain:
-    def __init__(self, date: datetime, symbol: str, quantity: int, proceeds: float, cost: float):
+    def __init__(self, date: datetime, symbol: str, quantity: int, proceeds: float, cost: float, action: str = 'SELL'):
         self.date = date
         self.symbol = symbol
         self.quantity = quantity
         self.proceeds = proceeds
         self.cost = cost
         self.gain = proceeds - cost
+        self.action = action  # 'BUY' или 'SELL'
 
 def get_uk_tax_year(date: datetime) -> int:
     year = date.year
     cutoff = datetime(year, 4, 5)
     return year - 1 if date <= cutoff else year
 
-def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Section104Pool, base_dir: str):
+def create_summary(realized_gains: List[RealizedGain]) -> dict:
+    """Создает итоговое саммари по всем операциям"""
+    acquisitions = set()
+    disposals = set()
+    total_proceeds = 0.0
+    total_gains = 0.0
+    total_losses = 0.0
+    
+    for gain in realized_gains:
+        if hasattr(gain, 'action') and gain.action == 'BUY':
+            acquisitions.add(gain.date)
+        else:
+            disposals.add(gain.date)
+            total_proceeds += gain.proceeds
+            if gain.gain > 0:
+                total_gains += gain.gain
+            else:
+                total_losses += abs(gain.gain)
+    
+    return {
+        'acquisitions': len(acquisitions),
+        'disposals': len(disposals),
+        'total_proceeds': total_proceeds,
+        'total_gains': total_gains,
+        'total_losses': total_losses,
+        'net_gain': total_gains - total_losses
+    }
+
+def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Section104Pool, exchange_rates: pd.DataFrame, base_dir: str):
     """Write detailed report for a specific tax year in both TXT and PDF formats"""
-    # Создаем базовые стили для PDF
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=16,
-        spaceAfter=30
-    )
-    heading_style = ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading2'],
-        fontSize=14,
-        spaceAfter=20
-    )
-    normal_style = styles['Normal']
-    
-    # Создаем PDF документ
-    pdf_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.pdf')
-    doc = SimpleDocTemplate(
-        pdf_file,
-        pagesize=A4,
-        rightMargin=72,
-        leftMargin=72,
-        topMargin=72,
-        bottomMargin=72
-    )
-    
-    # Подготавливаем элементы для PDF
-    elements = []
-    
-    # Заголовок
-    elements.append(Paragraph(f"CAPITAL GAINS REPORT FOR TAX YEAR {year}-{year+1}", title_style))
-    elements.append(Spacer(1, 20))
-    
-    year_gains = [rg for rg in realized_gains if get_uk_tax_year(rg.date) == year]
-    
-    # Месячная сводка
-    elements.append(Paragraph("MONTHLY BREAKDOWN", heading_style))
-    
-    monthly_summary = defaultdict(lambda: {'gains': 0.0, 'shares': 0, 'transactions': 0})
-    for rg in year_gains:
-        month = rg.date.strftime('%B %Y')
-        monthly_summary[month]['gains'] += rg.gain
-        monthly_summary[month]['shares'] += rg.quantity
-        monthly_summary[month]['transactions'] += 1
-    
-    # Создаем таблицу для месячной сводки
-    monthly_data = [['Month', 'Trades', 'Shares', 'Profit/Loss']]
-    for month, data in sorted(monthly_summary.items()):
-        monthly_data.append([
-            month,
-            str(data['transactions']),
-            f"{data['shares']:,}",
-            f"£{data['gains']:,.2f}"
-        ])
-    
-    monthly_table = Table(monthly_data, colWidths=[120, 80, 100, 120])
-    monthly_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-        ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
-        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 1), (-1, -1), 10),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
-    ]))
-    
-    elements.append(monthly_table)
-    elements.append(Spacer(1, 20))
-    
-    # Годовая сводка
-    elements.append(Paragraph("YEAR SUMMARY", heading_style))
-    
-    total_proceeds = sum(rg.proceeds for rg in year_gains)
-    total_cost = sum(rg.cost for rg in year_gains)
-    total_gain = sum(rg.gain for rg in year_gains)
-    total_shares = sum(rg.quantity for rg in year_gains)
-    
-    summary_data = [
-        ['Total Transactions:', f"{len(year_gains)}"],
-        ['Total Shares Sold:', f"{total_shares:,}"],
-        ['Total Proceeds:', f"£{total_proceeds:,.2f}"],
-        ['Total Cost Basis:', f"£{total_cost:,.2f}"],
-        ['Net Capital Gain:', f"£{total_gain:,.2f}"]
-    ]
-    
-    if total_shares > 0:
-        summary_data.append(['Average Gain per Share:', f"£{(total_gain/total_shares):,.2f}"])
-    
-    summary_table = Table(summary_data, colWidths=[150, 200])
-    summary_table.setStyle(TableStyle([
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-    ]))
-    
-    elements.append(summary_table)
-    elements.append(Spacer(1, 20))
-    
-    # Детальные транзакции
-    elements.append(Paragraph("DETAILED TRANSACTIONS", heading_style))
-    
-    for rg in year_gains:
-        transaction_data = [
-            ['Date:', rg.date.strftime('%d %B %Y')],
-            ['Shares Sold:', f"{rg.quantity:,}"],
-            ['Sale Price per Share:', f"£{(rg.proceeds/rg.quantity):,.2f}"],
-            ['Cost Basis per Share:', f"£{(rg.cost/rg.quantity):,.2f}"],
-            ['Profit per Share:', f"£{((rg.proceeds-rg.cost)/rg.quantity):,.2f}"],
-            ['Total Proceeds:', f"£{rg.proceeds:,.2f}"],
-            ['Total Cost Basis:', f"£{rg.cost:,.2f}"],
-            ['Total Profit/Loss:', f"£{rg.gain:,.2f}"]
-        ]
-        
-        transaction_table = Table(transaction_data, colWidths=[150, 200])
-        transaction_table.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-        ]))
-        
-        elements.append(transaction_table)
-        elements.append(Spacer(1, 20))
-    
-    # Генерируем PDF
-    doc.build(elements)
-    
-    # Также сохраняем текстовый файл (оставляем существующий код)
     report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
     
+    def get_exchange_rate(date):
+        """Get the exchange rate for the given date"""
+        closest_date = exchange_rates.index[exchange_rates.index <= pd.Timestamp(date)].max()
+        return exchange_rates.loc[closest_date, 'gbp_usd_rate']
+    
+    # Группируем операции по датам
+    operations_by_date = defaultdict(list)
+    acquisitions_by_date = defaultdict(list)
+    for rg in realized_gains:
+        if hasattr(rg, 'action') and rg.action == 'BUY':  # Используем только проверку на BUY
+            acquisitions_by_date[rg.date.date()].append(rg)
+        else:
+            operations_by_date[rg.date.date()].append(rg)
+    
     with open(report_file, 'w', encoding='utf-8') as f:
-        print(f"CAPITAL GAINS REPORT FOR TAX YEAR {year}-{year+1}", file=f)
-        print("=" * 80, file=f)
+        print(f"Capital Gains Tax Calculations for {year}-{year+1}", file=f)
         
-        # Add monthly breakdown
-        monthly_summary = defaultdict(lambda: {'gains': 0.0, 'shares': 0, 'transactions': 0})
-        for rg in year_gains:
-            month = rg.date.strftime('%B %Y')
-            monthly_summary[month]['gains'] += rg.gain
-            monthly_summary[month]['shares'] += rg.quantity
-            monthly_summary[month]['transactions'] += 1
-        
-        print("\nMONTHLY BREAKDOWN:", file=f)
-        print("-" * 80, file=f)
-        for month, data in sorted(monthly_summary.items()):
-            print(f"{month}:", file=f)
-            print(f"  Number of trades: {data['transactions']}", file=f)
-            print(f"  Shares sold: {data['shares']:,}", file=f)
-            print(f"  Profit/Loss: £{data['gains']:,.2f}", file=f)
-            print("-" * 40, file=f)
-        
-        # Year summary statistics
-        total_proceeds = sum(rg.proceeds for rg in year_gains)
-        total_cost = sum(rg.cost for rg in year_gains)
-        total_gain = sum(rg.gain for rg in year_gains)
-        total_shares = sum(rg.quantity for rg in year_gains)
-        
-        print("\nYEAR SUMMARY:", file=f)
-        print("-" * 80, file=f)
-        print(f"Total Transactions: {len(year_gains)}", file=f)
-        print(f"Total Shares Sold: {total_shares:,}", file=f)
-        print(f"Total Proceeds: £{total_proceeds:,.2f}", file=f)
-        print(f"Total Cost Basis: £{total_cost:,.2f}", file=f)
-        print(f"Net Capital Gain: £{total_gain:,.2f}", file=f)
-        if total_shares > 0:
-            print(f"Average Gain per Share: £{(total_gain/total_shares):,.2f}", file=f)
-        print("-" * 80, file=f)
-        
-        # Detailed transactions with improved formatting
-        print("\nDETAILED TRANSACTIONS:", file=f)
-        print("-" * 80, file=f)
-        for rg in year_gains:
-            print(f"Date: {rg.date.strftime('%d %B %Y')}", file=f)
-            print(f"Shares Sold: {rg.quantity:,}", file=f)
-            print("CALCULATION:", file=f)
-            print(f"  Sale Price: £{(rg.proceeds/rg.quantity):,.2f} per share", file=f)
-            print(f"  Cost Basis: £{(rg.cost/rg.quantity):,.2f} per share", file=f)
-            print(f"  Profit per Share: £{((rg.proceeds-rg.cost)/rg.quantity):,.2f}", file=f)
-            print("TOTALS:", file=f)
-            print(f"  Proceeds: £{rg.proceeds:,.2f}", file=f)
-            print(f"  Cost Basis: £{rg.cost:,.2f}", file=f)
-            print(f"  Profit/Loss: £{rg.gain:,.2f}", file=f)
-            print("-" * 80, file=f)
+        # Обрабатываем каждый день
+        all_dates = sorted(set(operations_by_date.keys()) | set(acquisitions_by_date.keys()))
+        for date in all_dates:
+            print(f"\n{date.strftime('%d %B %Y')}", file=f)
+            
+            # Обрабатываем приобретения (acquisitions)
+            if date in acquisitions_by_date:
+                daily_acqs = acquisitions_by_date[date]
+                exchange_rate = get_exchange_rate(date)
+                
+                for acq in daily_acqs:
+                    cost_gbp = acq.cost / exchange_rate
+                    price_per_unit = cost_gbp / acq.quantity
+                    
+                    print(f"Acquisition: {acq.quantity:,} units of {acq.symbol} "
+                          f"at £{cost_gbp:,.2f} (£{price_per_unit:.2f}/unit)", file=f)
+                    print(f"Number of units in the pool: {pool.total_shares:,}, "
+                          f"new pool cost: £{pool.total_cost / exchange_rate:.2f} "
+                          f"(£{pool.average_price / exchange_rate:.2f}/unit).", file=f)
+                    print("\n")
 
-def process_transactions_chronologically(history_file: str, equity_file: str, exchange_rates_file: str, output_dir: str):
+            # Обрабатываем продажи (disposals)
+            if date in operations_by_date:
+                daily_ops = operations_by_date[date]
+                exchange_rate = get_exchange_rate(date)
+                
+                for op in daily_ops:
+                    proceeds_gbp = op.proceeds / exchange_rate
+                    cost_gbp = op.cost / exchange_rate
+                    gain_gbp = proceeds_gbp - cost_gbp
+                    
+                    # Определяем тип матчинга из атрибута realized gain
+                    matching_type = getattr(op, 'action', 'SECTION_104')
+                    
+                    print(f"{matching_type}. Quantity: {op.quantity}, "
+                          f"allowable cost: £{cost_gbp:.2f}, "
+                          f"{'gain' if gain_gbp >= 0 else 'loss'}: £{abs(gain_gbp):.2f}", file=f)
+
+        # Добавляем итоговое саммари в конец отчета
+        summary = create_summary(realized_gains)
+        print("\nOverall Summary:", file=f)
+        print(f" Number of acquisitions: {summary['acquisitions']}", file=f)
+        print(f" Number of disposals: {summary['disposals']}", file=f)
+        print(f" Total disposal proceeds: £{summary['total_proceeds']:,.2f}", file=f)
+        print(f" Total capital gain before loss: £{summary['total_gains']:,.2f}", file=f)
+        print(f" Total capital loss: £{summary['total_losses']:,.2f}", file=f)
+        print(f" Total capital gain after loss: £{summary['net_gain']:,.2f}", file=f)
+
+class BedAndBreakfastTracker:
+    def __init__(self):
+        self.pending_sells = deque()
+        self.realized_gains = []
+        self.same_day_matches = {}  # Словарь для отслеживания same-day матчей
+        self.bnb_matches = {}       # Словарь для отслеживания B&B матчей
+
+    def add_sell(self, date: datetime, symbol: str, quantity: int, price: float):
+        """Добавляет продажу в очередь ожидания"""
+        self.pending_sells.append(Operation(date, 'SELL', symbol, quantity, price))
+
+    def process_buy(self, buy_op: Operation) -> int:
+        """Обрабатывает покупку, возвращает количество непокрытых акций"""
+        remaining_qty = buy_op.quantity
+
+        # Перебираем все продажи в 30-дневном окне
+        i = 0
+        while i < len(self.pending_sells):
+            sell_op = self.pending_sells[i]
+            
+            if (buy_op.date <= sell_op.date + timedelta(days=30) and 
+                buy_op.date > sell_op.date and 
+                sell_op.symbol == buy_op.symbol):
+                
+                # Определяем количество акций для покрытия
+                matched_qty = min(remaining_qty, sell_op.quantity)
+                
+                # Создаем realized gain с ценой покупки как базисом
+                cost = matched_qty * buy_op.price
+                proceeds = matched_qty * sell_op.price
+                self.realized_gains.append(RealizedGain(
+                    sell_op.date, sell_op.symbol, matched_qty, proceeds, cost
+                ))
+
+                # Обновляем количества
+                remaining_qty -= matched_qty
+                sell_op.quantity -= matched_qty
+                
+                # Удаляем полностью покрытые продажи
+                if sell_op.quantity == 0:
+                    self.pending_sells.remove(sell_op)
+                else:
+                    i += 1
+                
+                if remaining_qty == 0:
+                    break
+            else:
+                i += 1
+
+        return remaining_qty
+
+    def process_expired_sells(self, current_date: datetime, pool: Section104Pool):
+        """Обрабатывает просроченные продажи через Section 104 Pool"""
+        while self.pending_sells:
+            oldest_sell = self.pending_sells[0]
+            if (current_date - oldest_sell.date).days > 30:
+                avg_price = pool.remove_shares(oldest_sell.quantity)
+                proceeds = oldest_sell.quantity * oldest_sell.price
+                cost = oldest_sell.quantity * avg_price
+                self.realized_gains.append(RealizedGain(
+                    oldest_sell.date, oldest_sell.symbol, 
+                    oldest_sell.quantity, proceeds, cost
+                ))
+                self.pending_sells.popleft()
+            else:
+                break
+
+    def match_same_day(self, sell_op: Operation, buys: List[Operation]) -> Tuple[int, List[RealizedGain]]:
+        """Сопоставляет продажи с покупками того же дня"""
+        remaining_qty = sell_op.quantity
+        matched_gains = []
+        
+        same_day_buys = [b for b in buys if b.date.date() == sell_op.date.date()]
+        for buy in same_day_buys:
+            if remaining_qty <= 0:
+                break
+                
+            matched_qty = min(remaining_qty, buy.quantity)
+            cost = matched_qty * buy.price
+            proceeds = matched_qty * sell_op.price
+            
+            gain = RealizedGain(
+                sell_op.date, 
+                sell_op.symbol,
+                matched_qty,
+                proceeds,
+                cost,
+                'SAME_DAY'  # Добавляем тип матчинга
+            )
+            matched_gains.append(gain)
+            
+            # Сохраняем информацию о матчинге
+            self.same_day_matches[sell_op] = (buy, matched_qty)
+            
+            remaining_qty -= matched_qty
+            
+        return remaining_qty, matched_gains
+
+    def match_bed_and_breakfast(self, sell_op: Operation, buys: List[Operation], remaining_qty: int) -> Tuple[int, List[RealizedGain]]:
+        """Сопоставляет продажи с покупками в 30-дневном окне"""
+        matched_gains = []
+        
+        future_buys = [b for b in buys if 
+                      b.date > sell_op.date and 
+                      b.date <= sell_op.date + timedelta(days=30)]
+                      
+        for buy in future_buys:
+            if remaining_qty <= 0:
+                break
+                
+            matched_qty = min(remaining_qty, buy.quantity)
+            cost = matched_qty * buy.price
+            proceeds = matched_qty * sell_op.price
+            
+            gain = RealizedGain(
+                sell_op.date,
+                sell_op.symbol,
+                matched_qty,
+                proceeds,
+                cost,
+                'BED_AND_BREAKFAST'
+            )
+            matched_gains.append(gain)
+            
+            # Сохраняем информацию о матчинге
+            self.bnb_matches[sell_op] = (buy, matched_qty)
+            
+            remaining_qty -= matched_qty
+            
+        return remaining_qty, matched_gains
+
+    def process_transaction(self, transaction: Operation, pool: Section104Pool, all_transactions: List[Operation]) -> List[RealizedGain]:
+        """Обрабатывает транзакцию согласно правилам HMRC"""
+        if transaction.action == 'SELL':
+            gains = []
+            remaining_qty = transaction.quantity
+            
+            # 1. Same Day Rule
+            remaining_qty, same_day_gains = self.match_same_day(transaction, all_transactions)
+            gains.extend(same_day_gains)
+            
+            # 2. Bed and Breakfast Rule
+            if remaining_qty > 0:
+                remaining_qty, bnb_gains = self.match_bed_and_breakfast(transaction, all_transactions, remaining_qty)
+                gains.extend(bnb_gains)
+            
+            # 3. Section 104 Pool
+            if remaining_qty > 0:
+                avg_price = pool.remove_shares(remaining_qty)
+                proceeds = remaining_qty * transaction.price
+                cost = remaining_qty * avg_price
+                
+                gains.append(RealizedGain(
+                    transaction.date,
+                    transaction.symbol,
+                    remaining_qty,
+                    proceeds,
+                    cost,
+                    'SECTION_104'
+                ))
+                
+            return gains
+            
+        elif transaction.action == 'BUY':
+            pool.add_shares(transaction.quantity, transaction.price)
+            return []
+
+def process_transactions_chronologically(history_file: str, equity_file: str, 
+                                      exchange_rates_file: str, output_dir: str):
     """Process transactions and grants in chronological order."""
     equity_data = load_equity_data(equity_file)
     exchange_rates = load_exchange_rates(exchange_rates_file)
     transactions = load_transactions(history_file, equity_data, exchange_rates)
     
-    # Create operations list
     operations = []
+    all_realized_gains = []  # Добавляем список для всех операций
     
-    # Add vestings (BUY)
+    # Создаем операции покупки из грантов
     for grant in equity_data:
         if grant.lapse_date:
             lapse_date = pd.to_datetime(grant.lapse_date)
             total_shares = grant.net_shares + grant.shares_sold_for_taxes
-            # Get exchange rate for the lapse date
             closest_date = exchange_rates.index[exchange_rates.index <= lapse_date].max()
             exchange_rate = exchange_rates.loc[closest_date, 'gbp_usd_rate']
-            operations.append(Operation(
+            
+            # Создаем операцию покупки
+            buy_op = Operation(
                 date=lapse_date,
                 action='BUY',
                 symbol='RSU',
                 quantity=total_shares,
-                price=grant.fmv / exchange_rate  # Changed from multiplication to division
+                price=grant.fmv / exchange_rate
+            )
+            operations.append(buy_op)
+            
+            # Добавляем информацию о покупке в realized_gains
+            all_realized_gains.append(RealizedGain(
+                date=lapse_date,
+                symbol='RSU',
+                quantity=total_shares,
+                proceeds=total_shares * (grant.fmv / exchange_rate),
+                cost=total_shares * (grant.fmv / exchange_rate),
+                action='BUY'  # Добавляем информацию о типе операции
             ))
     
-    # Add sales (SELL)
+    # Добавляем продажи
     for trans in transactions:
         if trans.action == 'Sell':
             operations.append(Operation(
                 date=trans.date,
                 action='SELL',
-                symbol='RSU',  # or use actual symbol
-                quantity=-abs(trans.quantity),  # negative value for sales
+                symbol='RSU',
+                quantity=-abs(trans.quantity),
                 price=trans.amount / trans.quantity
             ))
     
-    # Sort operations by date
+    # Сортируем операции по дате
     operations.sort(key=lambda x: x.date)
     
-    # Process operations through Section 104 pool
+    # Инициализируем трекеры
     pool = Section104Pool()
-    realized_gains = []
+    bnb_tracker = BedAndBreakfastTracker()
     
     for op in operations:
-        if op.action == 'BUY':
-            pool.add_shares(op.quantity, op.price)
-        else:  # SELL
-            quantity = abs(op.quantity)
-            avg_price = pool.remove_shares(quantity)
-            proceeds = quantity * op.price
-            cost = quantity * avg_price
-            realized_gains.append(RealizedGain(
-                date=op.date,
-                symbol=op.symbol,
-                quantity=quantity,
-                proceeds=proceeds,
-                cost=cost
-            ))
-    
-    # Group by tax year and create separate reports
-    tax_years = set(get_uk_tax_year(rg.date) for rg in realized_gains)
-    
-    for year in tax_years:
-        write_year_report(year, realized_gains, pool, output_dir)
-    
-    # Write summary report
-    summary_file = os.path.join(output_dir, 'summary_report.txt')
-    with open(summary_file, 'w', encoding='utf-8') as f:
-        print("OVERALL CAPITAL GAINS SUMMARY", file=f)
-        print("=" * 80, file=f)
+        bnb_tracker.process_expired_sells(op.date, pool)
         
-        for year in sorted(tax_years):
-            year_gains = [rg for rg in realized_gains if get_uk_tax_year(rg.date) == year]
-            total_gain = sum(rg.gain for rg in year_gains)
-            print(f"\nTax Year {year}-{year+1}:", file=f)
-            print(f"Number of Transactions: {len(year_gains)}", file=f)
-            print(f"Total Capital Gain: £{total_gain:,.2f}", file=f)
-            print("-" * 80, file=f)
-        
-        print("\nCURRENT SECTION 104 HOLDING:", file=f)
-        print("-" * 80, file=f)
-        print(f"Shares in Pool: {pool.total_shares:,}", file=f)
-        print(f"Total Pool Cost: £{pool.total_cost:,.2f}", file=f)
-        print(f"Average Share Cost: £{pool.average_price:,.2f}", file=f)
+        if op.action == 'SELL':
+            bnb_tracker.add_sell(op.date, op.symbol, abs(op.quantity), op.price)
+        else:  # BUY
+            remaining_qty = bnb_tracker.process_buy(op)
+            if remaining_qty > 0:
+                pool.add_shares(remaining_qty, op.price)
+    
+    # Обрабатываем оставшиеся продажи
+    last_date = max(op.date for op in operations)
+    bnb_tracker.process_expired_sells(last_date + timedelta(days=31), pool)
+    
+    # Добавляем все realized gains от B&B трекера
+    all_realized_gains.extend(bnb_tracker.realized_gains)
+    
+    # Группируем по налоговым годам
+    gains_by_year = defaultdict(list)
+    for gain in all_realized_gains:  # Используем общий список all_realized_gains
+        tax_year = get_uk_tax_year(gain.date)
+        gains_by_year[tax_year].append(gain)
+    
+    # Создаем отчет для каждого налогового года
+    for year, gains in gains_by_year.items():
+        write_year_report(year, gains, pool, exchange_rates, output_dir)
 
 def build_report(history_file: str, equity_file: str, exchange_rates_file: str):
     """Build a report of stock transactions by loading data from history and equity files."""
