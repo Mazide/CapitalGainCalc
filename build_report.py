@@ -34,23 +34,34 @@ class Transaction:
         self.symbol = symbol
         self.quantity = int(float(str(quantity).replace(",", "")))
         
-        # Конвертация суммы из USD в GBP
+        # Сумма уже в USD, конвертируем в GBP один раз
         usd_amount = float(str(amount).replace("$", "").replace(",", ""))
         self.exchange_rate = self._get_exchange_rate(exchange_rates)
-        self.amount = usd_amount * (1 / self.exchange_rate)  # USD в GBP: умножаем на обратный курс
+        self.amount = usd_amount / self.exchange_rate  # USD в GBP
         
         self.grant = grant
         self.is_tax_sale = grant.shares_sold_for_taxes > 0 if grant else False
         
-        # Расчет FMV в GBP
-        self.fmv_total = (self.quantity * grant.fmv * (1 / self.exchange_rate)) if grant else 0  # USD в GBP
+        # Расчет FMV в GBP (сейчас grant.fmv в USD)
+        self.fmv_total = (self.quantity * grant.fmv / self.exchange_rate) if grant else 0
         self.gain = self.amount - self.fmv_total if grant else 0
 
     def _get_exchange_rate(self, exchange_rates: pd.DataFrame) -> float:
-        """Get the exchange rate for the transaction date"""
-        # Find the closest date that's not after our transaction date
-        closest_date = exchange_rates.index[exchange_rates.index <= self.date].max()
-        return exchange_rates.loc[closest_date, 'gbp_usd_rate']  # Changed column name
+        """Get the exchange rate for the transaction date's month"""
+        # Находим все курсы для нужного месяца и года
+        month_rates = exchange_rates[
+            (exchange_rates.index.year == self.date.year) & 
+            (exchange_rates.index.month == self.date.month)
+        ]
+        
+        if month_rates.empty:
+            raise ValueError(
+                f"Не найден курс обмена для {self.date.strftime('%B %Y')}. "
+                f"Убедитесь, что файл exchange_rates.csv содержит данные для этого периода."
+            )
+            
+        # Берем первый курс за месяц
+        return month_rates.iloc[0]['gbp_usd_rate']
 
     def __str__(self):
         base_str = (
@@ -62,12 +73,12 @@ class Transaction:
         )
         if self.grant:
             base_str += (
-                f"FMV at Vest: £{(self.grant.fmv * (1 / self.exchange_rate)):,.2f}\n"
+                f"FMV at Vest: £{(self.grant.fmv / self.exchange_rate):,.2f}\n"
                 f"Total FMV Value: £{self.fmv_total:,.2f}\n"
                 f"Gain/Loss: £{self.gain:,.2f}\n"
                 f"Award ID: {self.grant.award_id}\n"
                 f"Tax Sale: {'Yes' if self.is_tax_sale else 'No'}\n"
-                f"Tax Amount: £{(self.grant.taxes * (1 / self.exchange_rate)):,.2f}"
+                f"Tax Amount: £{(self.grant.taxes / self.exchange_rate):,.2f}"
             )
         return base_str
 
@@ -234,20 +245,33 @@ def create_summary(realized_gains: List[RealizedGain]) -> dict:
         'net_gain': total_gains - total_losses
     }
 
-def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Section104Pool, exchange_rates: pd.DataFrame, base_dir: str):
-    """Write detailed report for a specific tax year in both TXT and PDF formats"""
+def write_year_report(year: int, realized_gains: List[RealizedGain], initial_pool: Section104Pool, 
+                     exchange_rates: pd.DataFrame, base_dir: str) -> Section104Pool:
+    """Write detailed report for a specific tax year and return updated pool state"""
     report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
     
+    # Создаем копию начального состояния пула
+    report_pool = Section104Pool()
+    report_pool.total_shares = initial_pool.total_shares
+    report_pool.total_cost = initial_pool.total_cost
+    
     def get_exchange_rate(date):
-        """Get the exchange rate for the given date"""
         closest_date = exchange_rates.index[exchange_rates.index <= pd.Timestamp(date)].max()
         return exchange_rates.loc[closest_date, 'gbp_usd_rate']
+    
+    def print_pool_state(f, prefix="Current"):
+        """Helper function to print pool state"""
+        print(f"\n{prefix} Pool State:", file=f)
+        print(f"Number of shares: {report_pool.total_shares:,}", file=f)
+        print(f"Total pool cost: £{report_pool.total_cost:.2f}", file=f)
+        print(f"Average price per share: £{report_pool.average_price:.2f}", file=f)
+        print("-" * 40, file=f)
     
     # Группируем операции по датам
     operations_by_date = defaultdict(list)
     acquisitions_by_date = defaultdict(list)
     for rg in realized_gains:
-        if hasattr(rg, 'action') and rg.action == 'BUY':  # Используем только проверку на BUY
+        if hasattr(rg, 'action') and rg.action == 'BUY':
             acquisitions_by_date[rg.date.date()].append(rg)
         else:
             operations_by_date[rg.date.date()].append(rg)
@@ -255,13 +279,18 @@ def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Secti
     with open(report_file, 'w', encoding='utf-8') as f:
         print(f"Capital Gains Tax Calculations for {year}-{year+1}", file=f)
         
+        # Печатаем начальное состояние пула в начале года
+        print_pool_state(f, prefix="Initial")
+        
         # Обрабатываем каждый день
         all_dates = sorted(set(operations_by_date.keys()) | set(acquisitions_by_date.keys()))
         for date in all_dates:
             print(f"\n{date.strftime('%d %B %Y')}", file=f)
+            had_activity = False
             
-            # Обрабатываем приобретения (acquisitions)
+            # Обрабатываем приобретения
             if date in acquisitions_by_date:
+                had_activity = True
                 daily_acqs = acquisitions_by_date[date]
                 exchange_rate = get_exchange_rate(date)
                 
@@ -269,29 +298,38 @@ def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Secti
                     cost_gbp = acq.cost / exchange_rate
                     price_per_unit = cost_gbp / acq.quantity
                     
+                    # Добавляем акции в пул отчета
+                    report_pool.add_shares(acq.quantity, price_per_unit)
+                    
                     print(f"Acquisition: {acq.quantity:,} units of {acq.symbol} "
                           f"at £{cost_gbp:,.2f} (£{price_per_unit:.2f}/unit)", file=f)
-                    print(f"Number of units in the pool: {pool.total_shares:,}, "
-                          f"new pool cost: £{pool.total_cost / exchange_rate:.2f} "
-                          f"(£{pool.average_price / exchange_rate:.2f}/unit).", file=f)
-                    print("\n")
+                    print(f"Number of units in the pool: {report_pool.total_shares:,}, "
+                          f"new pool cost: £{report_pool.total_cost:.2f} "
+                          f"(£{report_pool.average_price:.2f}/unit).", file=f)
 
-            # Обрабатываем продажи (disposals)
+            # Обрабатываем продажи
             if date in operations_by_date:
+                had_activity = True
                 daily_ops = operations_by_date[date]
                 exchange_rate = get_exchange_rate(date)
                 
                 for op in daily_ops:
-                    proceeds_gbp = op.proceeds / exchange_rate
-                    cost_gbp = op.cost / exchange_rate
+                    # Убираем повторную конвертацию, т.к. значения уже в GBP
+                    proceeds_gbp = op.proceeds
+                    cost_gbp = op.cost
                     gain_gbp = proceeds_gbp - cost_gbp
                     
-                    # Определяем тип матчинга из атрибута realized gain
-                    matching_type = getattr(op, 'action', 'SECTION_104')
+                    # Остальной код без изменений
+                    avg_cost = report_pool.remove_shares(op.quantity)
                     
+                    matching_type = getattr(op, 'action', 'SECTION_104')
                     print(f"{matching_type}. Quantity: {op.quantity}, "
                           f"allowable cost: £{cost_gbp:.2f}, "
                           f"{'gain' if gain_gbp >= 0 else 'loss'}: £{abs(gain_gbp):.2f}", file=f)
+            
+            # Печатаем состояние пула в конце дня, если были активности
+            if had_activity:
+                print_pool_state(f, prefix="End of Day")
 
         # Добавляем итоговое саммари в конец отчета
         summary = create_summary(realized_gains)
@@ -302,6 +340,8 @@ def write_year_report(year: int, realized_gains: List[RealizedGain], pool: Secti
         print(f" Total capital gain before loss: £{summary['total_gains']:,.2f}", file=f)
         print(f" Total capital loss: £{summary['total_losses']:,.2f}", file=f)
         print(f" Total capital gain after loss: £{summary['net_gain']:,.2f}", file=f)
+
+    return report_pool  # Возвращаем обновленное состояние пула
 
 class BedAndBreakfastTracker:
     def __init__(self):
@@ -452,8 +492,8 @@ class BedAndBreakfastTracker:
             # 3. Section 104 Pool
             if remaining_qty > 0:
                 avg_price = pool.remove_shares(remaining_qty)
-                proceeds = remaining_qty * transaction.price
-                cost = remaining_qty * avg_price
+                proceeds = remaining_qty * transaction.price  # Уже в GBP
+                cost = remaining_qty * avg_price  # Уже в GBP
                 
                 gains.append(RealizedGain(
                     transaction.date,
@@ -478,7 +518,7 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
     transactions = load_transactions(history_file, equity_data, exchange_rates)
     
     operations = []
-    all_realized_gains = []  # Добавляем список для всех операций
+    all_realized_gains = []
     
     # Создаем операции покупки из грантов
     for grant in equity_data:
@@ -488,7 +528,6 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
             closest_date = exchange_rates.index[exchange_rates.index <= lapse_date].max()
             exchange_rate = exchange_rates.loc[closest_date, 'gbp_usd_rate']
             
-            # Создаем операцию покупки
             buy_op = Operation(
                 date=lapse_date,
                 action='BUY',
@@ -498,14 +537,13 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
             )
             operations.append(buy_op)
             
-            # Добавляем информацию о покупке в realized_gains
             all_realized_gains.append(RealizedGain(
                 date=lapse_date,
                 symbol='RSU',
                 quantity=total_shares,
                 proceeds=total_shares * (grant.fmv / exchange_rate),
                 cost=total_shares * (grant.fmv / exchange_rate),
-                action='BUY'  # Добавляем информацию о типе операции
+                action='BUY'
             ))
     
     # Добавляем продажи
@@ -526,6 +564,7 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
     pool = Section104Pool()
     bnb_tracker = BedAndBreakfastTracker()
     
+    # Обрабатываем операции хронологически
     for op in operations:
         bnb_tracker.process_expired_sells(op.date, pool)
         
@@ -545,13 +584,17 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
     
     # Группируем по налоговым годам
     gains_by_year = defaultdict(list)
-    for gain in all_realized_gains:  # Используем общий список all_realized_gains
+    for gain in all_realized_gains:
         tax_year = get_uk_tax_year(gain.date)
         gains_by_year[tax_year].append(gain)
     
-    # Создаем отчет для каждого налогового года
-    for year, gains in gains_by_year.items():
-        write_year_report(year, gains, pool, exchange_rates, output_dir)
+    # Сортируем годы
+    sorted_years = sorted(gains_by_year.keys())
+    
+    # Создаем отчет для каждого налогового года, передавая и получая обновленное состояние пула
+    current_pool = Section104Pool()
+    for year in sorted_years:
+        current_pool = write_year_report(year, gains_by_year[year], current_pool, exchange_rates, output_dir)
 
 def build_report(history_file: str, equity_file: str, exchange_rates_file: str):
     """Build a report of stock transactions by loading data from history and equity files."""
