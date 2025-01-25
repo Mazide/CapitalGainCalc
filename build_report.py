@@ -212,6 +212,81 @@ class RealizedGain:
         self.gain = proceeds - cost
         self.action = action  # 'BUY' или 'SELL'
 
+class MatchingTracker:
+    def __init__(self):
+        self.buys = deque()  # очередь всех покупок
+        self.section_104_pool = Section104Pool()
+
+    def add_buy(self, buy: Operation):
+        self.buys.append(buy)
+        self.section_104_pool.add_shares(buy.quantity, buy.price)
+
+    def match_sale(self, sell: Operation) -> List[RealizedGain]:
+        realized_gains = []
+        remaining_quantity = sell.quantity
+        
+        # 1. Same-day matching
+        same_day_buys = [b for b in self.buys if b.date.date() == sell.date.date()]
+        remaining_quantity, same_day_gains = self._match_buys(
+            same_day_buys, sell, remaining_quantity, 'SAME_DAY'
+        )
+        realized_gains.extend(same_day_gains)
+
+        # 2. Bed and Breakfast matching (в течение 30 дней)
+        if remaining_quantity > 0:
+            cutoff_date = sell.date - timedelta(days=30)
+            bnb_buys = [b for b in self.buys 
+                       if cutoff_date < b.date < sell.date]
+            remaining_quantity, bnb_gains = self._match_buys(
+                bnb_buys, sell, remaining_quantity, 'BED_AND_BREAKFAST'
+            )
+            realized_gains.extend(bnb_gains)
+
+        # 3. Section 104 для оставшегося количества
+        if remaining_quantity > 0:
+            avg_price = self.section_104_pool.remove_shares(remaining_quantity)
+            realized_gains.append(RealizedGain(
+                date=sell.date,
+                symbol=sell.symbol,
+                quantity=remaining_quantity,
+                proceeds=remaining_quantity * sell.price,
+                cost=remaining_quantity * avg_price,
+                action='SECTION_104'
+            ))
+
+        # Очищаем использованные покупки
+        self.buys = deque(b for b in self.buys if b.quantity > 0)
+        
+        return realized_gains
+
+    def _match_buys(self, buys: List[Operation], sell: Operation, 
+                    quantity: int, match_type: str) -> Tuple[int, List[RealizedGain]]:
+        realized_gains = []
+        remaining = quantity
+
+        for buy in buys:
+            if remaining <= 0:
+                break
+
+            match_quantity = min(remaining, buy.quantity)
+            
+            realized_gains.append(RealizedGain(
+                date=sell.date,
+                symbol=sell.symbol,
+                quantity=match_quantity,
+                proceeds=match_quantity * sell.price,
+                cost=match_quantity * buy.price,
+                action=match_type
+            ))
+
+            remaining -= match_quantity
+            buy.quantity -= match_quantity
+            
+            # Корректируем Section 104 pool
+            self.section_104_pool.remove_shares(match_quantity)
+
+        return remaining, realized_gains
+
 def get_uk_tax_year(date: datetime) -> int:
     year = date.year
     cutoff = datetime(year, 4, 5)
@@ -245,280 +320,14 @@ def create_summary(realized_gains: List[RealizedGain]) -> dict:
         'net_gain': total_gains - total_losses
     }
 
-def write_year_report(year: int, realized_gains: List[RealizedGain], initial_pool: Section104Pool, 
-                     exchange_rates: pd.DataFrame, base_dir: str) -> Section104Pool:
-    """Write detailed report for a specific tax year and return updated pool state"""
-    report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
-    
-    # Создаем копию начального состояния пула
-    report_pool = Section104Pool()
-    report_pool.total_shares = initial_pool.total_shares
-    report_pool.total_cost = initial_pool.total_cost
-    
-    def get_exchange_rate(date):
-        closest_date = exchange_rates.index[exchange_rates.index <= pd.Timestamp(date)].max()
-        return exchange_rates.loc[closest_date, 'gbp_usd_rate']
-    
-    def print_pool_state(f, prefix="Current"):
-        """Helper function to print pool state"""
-        print(f"\n{prefix} Pool State:", file=f)
-        print(f"Number of shares: {report_pool.total_shares:,}", file=f)
-        print(f"Total pool cost: £{report_pool.total_cost:.2f}", file=f)
-        print(f"Average price per share: £{report_pool.average_price:.2f}", file=f)
-        print("-" * 40, file=f)
-    
-    # Группируем операции по датам
-    operations_by_date = defaultdict(list)
-    acquisitions_by_date = defaultdict(list)
-    for rg in realized_gains:
-        if hasattr(rg, 'action') and rg.action == 'BUY':
-            acquisitions_by_date[rg.date.date()].append(rg)
-        else:
-            operations_by_date[rg.date.date()].append(rg)
-    
-    with open(report_file, 'w', encoding='utf-8') as f:
-        print(f"Capital Gains Tax Calculations for {year}-{year+1}", file=f)
-        
-        # Печатаем начальное состояние пула в начале года
-        print_pool_state(f, prefix="Initial")
-        
-        # Обрабатываем каждый день
-        all_dates = sorted(set(operations_by_date.keys()) | set(acquisitions_by_date.keys()))
-        for date in all_dates:
-            print(f"\n{date.strftime('%d %B %Y')}", file=f)
-            had_activity = False
-            
-            # Обрабатываем приобретения
-            if date in acquisitions_by_date:
-                had_activity = True
-                daily_acqs = acquisitions_by_date[date]
-                exchange_rate = get_exchange_rate(date)
-                
-                for acq in daily_acqs:
-                    cost_gbp = acq.cost / exchange_rate
-                    price_per_unit = cost_gbp / acq.quantity
-                    
-                    # Добавляем акции в пул отчета
-                    report_pool.add_shares(acq.quantity, price_per_unit)
-                    
-                    print(f"Acquisition: {acq.quantity:,} units of {acq.symbol} "
-                          f"at £{cost_gbp:,.2f} (£{price_per_unit:.2f}/unit)", file=f)
-                    print(f"Number of units in the pool: {report_pool.total_shares:,}, "
-                          f"new pool cost: £{report_pool.total_cost:.2f} "
-                          f"(£{report_pool.average_price:.2f}/unit).", file=f)
-
-            # Обрабатываем продажи
-            if date in operations_by_date:
-                had_activity = True
-                daily_ops = operations_by_date[date]
-                exchange_rate = get_exchange_rate(date)
-                
-                for op in daily_ops:
-                    # Убираем повторную конвертацию, т.к. значения уже в GBP
-                    proceeds_gbp = op.proceeds
-                    cost_gbp = op.cost
-                    gain_gbp = proceeds_gbp - cost_gbp
-                    
-                    # Остальной код без изменений
-                    avg_cost = report_pool.remove_shares(op.quantity)
-                    
-                    matching_type = getattr(op, 'action', 'SECTION_104')
-                    print(f"{matching_type}. Quantity: {op.quantity}, "
-                          f"allowable cost: £{cost_gbp:.2f}, "
-                          f"{'gain' if gain_gbp >= 0 else 'loss'}: £{abs(gain_gbp):.2f}", file=f)
-            
-            # Печатаем состояние пула в конце дня, если были активности
-            if had_activity:
-                print_pool_state(f, prefix="End of Day")
-
-        # Добавляем итоговое саммари в конец отчета
-        summary = create_summary(realized_gains)
-        print("\nOverall Summary:", file=f)
-        print(f" Number of acquisitions: {summary['acquisitions']}", file=f)
-        print(f" Number of disposals: {summary['disposals']}", file=f)
-        print(f" Total disposal proceeds: £{summary['total_proceeds']:,.2f}", file=f)
-        print(f" Total capital gain before loss: £{summary['total_gains']:,.2f}", file=f)
-        print(f" Total capital loss: £{summary['total_losses']:,.2f}", file=f)
-        print(f" Total capital gain after loss: £{summary['net_gain']:,.2f}", file=f)
-
-    return report_pool  # Возвращаем обновленное состояние пула
-
-class BedAndBreakfastTracker:
-    def __init__(self):
-        self.pending_sells = deque()
-        self.realized_gains = []
-        self.same_day_matches = {}  # Словарь для отслеживания same-day матчей
-        self.bnb_matches = {}       # Словарь для отслеживания B&B матчей
-
-    def add_sell(self, date: datetime, symbol: str, quantity: int, price: float):
-        """Добавляет продажу в очередь ожидания"""
-        self.pending_sells.append(Operation(date, 'SELL', symbol, quantity, price))
-
-    def process_buy(self, buy_op: Operation) -> int:
-        """Обрабатывает покупку, возвращает количество непокрытых акций"""
-        remaining_qty = buy_op.quantity
-
-        # Перебираем все продажи в 30-дневном окне
-        i = 0
-        while i < len(self.pending_sells):
-            sell_op = self.pending_sells[i]
-            
-            if (buy_op.date <= sell_op.date + timedelta(days=30) and 
-                buy_op.date > sell_op.date and 
-                sell_op.symbol == buy_op.symbol):
-                
-                # Определяем количество акций для покрытия
-                matched_qty = min(remaining_qty, sell_op.quantity)
-                
-                # Создаем realized gain с ценой покупки как базисом
-                cost = matched_qty * buy_op.price
-                proceeds = matched_qty * sell_op.price
-                self.realized_gains.append(RealizedGain(
-                    sell_op.date, sell_op.symbol, matched_qty, proceeds, cost
-                ))
-
-                # Обновляем количества
-                remaining_qty -= matched_qty
-                sell_op.quantity -= matched_qty
-                
-                # Удаляем полностью покрытые продажи
-                if sell_op.quantity == 0:
-                    self.pending_sells.remove(sell_op)
-                else:
-                    i += 1
-                
-                if remaining_qty == 0:
-                    break
-            else:
-                i += 1
-
-        return remaining_qty
-
-    def process_expired_sells(self, current_date: datetime, pool: Section104Pool):
-        """Обрабатывает просроченные продажи через Section 104 Pool"""
-        while self.pending_sells:
-            oldest_sell = self.pending_sells[0]
-            if (current_date - oldest_sell.date).days > 30:
-                avg_price = pool.remove_shares(oldest_sell.quantity)
-                proceeds = oldest_sell.quantity * oldest_sell.price
-                cost = oldest_sell.quantity * avg_price
-                self.realized_gains.append(RealizedGain(
-                    oldest_sell.date, oldest_sell.symbol, 
-                    oldest_sell.quantity, proceeds, cost
-                ))
-                self.pending_sells.popleft()
-            else:
-                break
-
-    def match_same_day(self, sell_op: Operation, buys: List[Operation]) -> Tuple[int, List[RealizedGain]]:
-        """Сопоставляет продажи с покупками того же дня"""
-        remaining_qty = sell_op.quantity
-        matched_gains = []
-        
-        same_day_buys = [b for b in buys if b.date.date() == sell_op.date.date()]
-        for buy in same_day_buys:
-            if remaining_qty <= 0:
-                break
-                
-            matched_qty = min(remaining_qty, buy.quantity)
-            cost = matched_qty * buy.price
-            proceeds = matched_qty * sell_op.price
-            
-            gain = RealizedGain(
-                sell_op.date, 
-                sell_op.symbol,
-                matched_qty,
-                proceeds,
-                cost,
-                'SAME_DAY'  # Добавляем тип матчинга
-            )
-            matched_gains.append(gain)
-            
-            # Сохраняем информацию о матчинге
-            self.same_day_matches[sell_op] = (buy, matched_qty)
-            
-            remaining_qty -= matched_qty
-            
-        return remaining_qty, matched_gains
-
-    def match_bed_and_breakfast(self, sell_op: Operation, buys: List[Operation], remaining_qty: int) -> Tuple[int, List[RealizedGain]]:
-        """Сопоставляет продажи с покупками в 30-дневном окне"""
-        matched_gains = []
-        
-        future_buys = [b for b in buys if 
-                      b.date > sell_op.date and 
-                      b.date <= sell_op.date + timedelta(days=30)]
-                      
-        for buy in future_buys:
-            if remaining_qty <= 0:
-                break
-                
-            matched_qty = min(remaining_qty, buy.quantity)
-            cost = matched_qty * buy.price
-            proceeds = matched_qty * sell_op.price
-            
-            gain = RealizedGain(
-                sell_op.date,
-                sell_op.symbol,
-                matched_qty,
-                proceeds,
-                cost,
-                'BED_AND_BREAKFAST'
-            )
-            matched_gains.append(gain)
-            
-            # Сохраняем информацию о матчинге
-            self.bnb_matches[sell_op] = (buy, matched_qty)
-            
-            remaining_qty -= matched_qty
-            
-        return remaining_qty, matched_gains
-
-    def process_transaction(self, transaction: Operation, pool: Section104Pool, all_transactions: List[Operation]) -> List[RealizedGain]:
-        """Обрабатывает транзакцию согласно правилам HMRC"""
-        if transaction.action == 'SELL':
-            gains = []
-            remaining_qty = transaction.quantity
-            
-            # 1. Same Day Rule
-            remaining_qty, same_day_gains = self.match_same_day(transaction, all_transactions)
-            gains.extend(same_day_gains)
-            
-            # 2. Bed and Breakfast Rule
-            if remaining_qty > 0:
-                remaining_qty, bnb_gains = self.match_bed_and_breakfast(transaction, all_transactions, remaining_qty)
-                gains.extend(bnb_gains)
-            
-            # 3. Section 104 Pool
-            if remaining_qty > 0:
-                avg_price = pool.remove_shares(remaining_qty)
-                proceeds = remaining_qty * transaction.price  # Уже в GBP
-                cost = remaining_qty * avg_price  # Уже в GBP
-                
-                gains.append(RealizedGain(
-                    transaction.date,
-                    transaction.symbol,
-                    remaining_qty,
-                    proceeds,
-                    cost,
-                    'SECTION_104'
-                ))
-                
-            return gains
-            
-        elif transaction.action == 'BUY':
-            pool.add_shares(transaction.quantity, transaction.price)
-            return []
-
 def process_transactions_chronologically(history_file: str, equity_file: str, 
-                                      exchange_rates_file: str, output_dir: str):
-    """Process transactions and grants in chronological order."""
+                                      exchange_rates_file: str) -> List[Operation]:
+    """Обрабатывает транзакции и гранты хронологически и возвращает список операций."""
     equity_data = load_equity_data(equity_file)
     exchange_rates = load_exchange_rates(exchange_rates_file)
     transactions = load_transactions(history_file, equity_data, exchange_rates)
     
     operations = []
-    all_realized_gains = []
     
     # Создаем операции покупки из грантов
     for grant in equity_data:
@@ -528,22 +337,12 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
             closest_date = exchange_rates.index[exchange_rates.index <= lapse_date].max()
             exchange_rate = exchange_rates.loc[closest_date, 'gbp_usd_rate']
             
-            buy_op = Operation(
+            operations.append(Operation(
                 date=lapse_date,
                 action='BUY',
                 symbol='RSU',
                 quantity=total_shares,
                 price=grant.fmv / exchange_rate
-            )
-            operations.append(buy_op)
-            
-            all_realized_gains.append(RealizedGain(
-                date=lapse_date,
-                symbol='RSU',
-                quantity=total_shares,
-                proceeds=total_shares * (grant.fmv / exchange_rate),
-                cost=total_shares * (grant.fmv / exchange_rate),
-                action='BUY'
             ))
     
     # Добавляем продажи
@@ -553,56 +352,125 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
                 date=trans.date,
                 action='SELL',
                 symbol='RSU',
-                quantity=-abs(trans.quantity),
+                quantity=trans.quantity,
                 price=trans.amount / trans.quantity
             ))
     
     # Сортируем операции по дате
     operations.sort(key=lambda x: x.date)
+    return operations
+
+def write_year_report(year: int, operations: List[Operation], bnb_tracker: MatchingTracker, 
+                     exchange_rates: pd.DataFrame, base_dir: str) -> MatchingTracker:
+    """Создает отчет для конкретного налогового года и возвращает обновленное состояние трекера."""
+    report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
     
-    # Инициализируем трекеры
-    pool = Section104Pool()
-    bnb_tracker = BedAndBreakfastTracker()
+    realized_gains = []
     
-    # Обрабатываем операции хронологически
-    for op in operations:
-        bnb_tracker.process_expired_sells(op.date, pool)
+    with open(report_file, 'w', encoding='utf-8') as f:
+        print(f"Capital Gains Tax Calculations for {year}-{year+1}", file=f)
         
-        if op.action == 'SELL':
-            bnb_tracker.add_sell(op.date, op.symbol, abs(op.quantity), op.price)
-        else:  # BUY
-            remaining_qty = bnb_tracker.process_buy(op)
-            if remaining_qty > 0:
-                pool.add_shares(remaining_qty, op.price)
+        # Группируем операции по датам
+        operations_by_date = defaultdict(list)
+        for op in operations:
+            operations_by_date[op.date.date()].append(op)
+        
+        # Обрабатываем каждый день
+        for date in sorted(operations_by_date.keys()):
+            daily_ops = operations_by_date[date]
+            
+            # Сначала обрабатываем все покупки дня
+            buys = [op for op in daily_ops if op.action == 'BUY']
+            sells = [op for op in daily_ops if op.action == 'SELL']
+
+            # Добавляем покупки в BnB трекер
+            for buy in buys:
+                bnb_tracker.add_buy(buy)
+                realized_gains.append(RealizedGain(
+                    buy.date,
+                    buy.symbol,
+                    buy.quantity,
+                    0.0,
+                    buy.quantity * buy.price,
+                    'BUY'
+                ))
+            
+            # Обрабатываем продажи
+            for sell in sells:
+                # 1. Same-day и BnB matching
+                matching_gains = bnb_tracker.match_sale(sell)
+                realized_gains.extend(matching_gains)
+            
+            # Печатаем состояние пула и операции дня
+            print_daily_summary(f, date, daily_ops, bnb_tracker.section_104_pool, realized_gains)
+        
+        # Печатаем итоговое саммари
+        print_year_summary(f, realized_gains)
     
-    # Обрабатываем оставшиеся продажи
-    last_date = max(op.date for op in operations)
-    bnb_tracker.process_expired_sells(last_date + timedelta(days=31), pool)
+    return bnb_tracker
+
+def print_daily_summary(f, date: datetime, operations: List[Operation], pool: Section104Pool, 
+                       realized_gains: List[RealizedGain]):
+    """Prints daily summary of operations"""
+    formatted_date = date.strftime("%d %B %Y")  # Форматируем дату как "01 March 2024"
+    print(f"\nDate: {formatted_date}", file=f)
+    print("-" * 50, file=f)
     
-    # Добавляем все realized gains от B&B трекера
-    all_realized_gains.extend(bnb_tracker.realized_gains)
+    # Print operations
+    for op in operations:
+        print(f"{op.action}: {op.quantity} shares at £{op.price:.2f}", file=f)
     
-    # Группируем по налоговым годам
-    gains_by_year = defaultdict(list)
-    for gain in all_realized_gains:
-        tax_year = get_uk_tax_year(gain.date)
-        gains_by_year[tax_year].append(gain)
+    # Print Section 104 pool status
+    print(f"\nSection 104 Pool Status:", file=f)
+    print(f"Total shares: {pool.total_shares}", file=f)
+    print(f"Average price: £{pool.average_price:.2f}", file=f)
+    print(f"Total cost: £{pool.total_cost:.2f}", file=f)
     
-    # Сортируем годы
-    sorted_years = sorted(gains_by_year.keys())
+    # Print realized gains/losses for the day
+    daily_gains = [g for g in realized_gains if g.date.date() == date]
+    if daily_gains:
+        print("\nRealized Gains/Losses:", file=f)
+        for gain in daily_gains:
+            print(f"{gain.action}: {gain.quantity} shares, "
+                  f"proceeds: £{gain.proceeds:.2f}, "
+                  f"cost: £{gain.cost:.2f}, "
+                  f"gain/loss: £{gain.gain:.2f}", file=f)
+
+def print_year_summary(f, realized_gains: List[RealizedGain]):
+    """Prints yearly summary"""
+    summary = create_summary(realized_gains)
     
-    # Создаем отчет для каждого налогового года, передавая и получая обновленное состояние пула
-    current_pool = Section104Pool()
-    for year in sorted_years:
-        current_pool = write_year_report(year, gains_by_year[year], current_pool, exchange_rates, output_dir)
+    print("\n" + "=" * 50, file=f)
+    print("YEARLY SUMMARY", file=f)
+    print("=" * 50, file=f)
+    print(f"Number of acquisitions: {summary['acquisitions']}", file=f)
+    print(f"Number of disposals: {summary['disposals']}", file=f)
+    print(f"Total proceeds: £{summary['total_proceeds']:.2f}", file=f)
+    print(f"Total gains: £{summary['total_gains']:.2f}", file=f)
+    print(f"Total losses: £{summary['total_losses']:.2f}", file=f)
+    print(f"Net gain/loss: £{summary['net_gain']:.2f}", file=f)
+    print("=" * 50, file=f)
 
 def build_report(history_file: str, equity_file: str, exchange_rates_file: str):
-    """Build a report of stock transactions by loading data from history and equity files."""
+    """Создает отчет по транзакциям акций."""
     base_dir = 'reports'
     os.makedirs(base_dir, exist_ok=True)
     
-    process_transactions_chronologically(history_file, equity_file, exchange_rates_file, base_dir)
+    exchange_rates = load_exchange_rates(exchange_rates_file)
+    operations = process_transactions_chronologically(history_file, equity_file, exchange_rates_file)
     
-    print(f"Reports generated in directory: {base_dir}")
+    # Группируем операции по налоговым годам
+    ops_by_year = defaultdict(list)
+    for op in operations:
+        tax_year = get_uk_tax_year(op.date)
+        ops_by_year[tax_year].append(op)
+    
+    # Создаем отчеты по годам
+    bnb_tracker = MatchingTracker()  # Создаем один трекер для всех лет
+    for year in sorted(ops_by_year.keys()):
+        bnb_tracker = write_year_report(year, ops_by_year[year], bnb_tracker, exchange_rates, base_dir)
+    
+    print(f"Отчеты сгенерированы в директории: {base_dir}")
+
 
 build_report('history.csv', 'equity.csv', 'exchange_rates.csv')
