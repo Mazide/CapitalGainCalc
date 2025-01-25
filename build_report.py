@@ -412,7 +412,7 @@ def write_year_report(year: int, operations: List[Operation], bnb_tracker: Match
 def print_daily_summary(f, date: datetime, operations: List[Operation], pool: Section104Pool, 
                        realized_gains: List[RealizedGain]):
     """Prints daily summary of operations"""
-    formatted_date = date.strftime("%d %B %Y")  # Форматируем дату как "01 March 2024"
+    formatted_date = date.strftime("%d %B %Y")
     print(f"\nDate: {formatted_date}", file=f)
     print("-" * 50, file=f)
     
@@ -426,8 +426,8 @@ def print_daily_summary(f, date: datetime, operations: List[Operation], pool: Se
     print(f"Average price: £{pool.average_price:.2f}", file=f)
     print(f"Total cost: £{pool.total_cost:.2f}", file=f)
     
-    # Print realized gains/losses for the day
-    daily_gains = [g for g in realized_gains if g.date.date() == date]
+    # Print only SELL realized gains/losses for the day
+    daily_gains = [g for g in realized_gains if g.date.date() == date and g.action != 'BUY']
     if daily_gains:
         print("\nRealized Gains/Losses:", file=f)
         for gain in daily_gains:
