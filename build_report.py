@@ -13,7 +13,8 @@ from reportlab.lib.units import inch
 class EquityGrant:
     def __init__(self, award_date: str, award_id: str, fmv: float, sale_price: float, 
                  shares_sold_for_taxes: int, net_shares: int, taxes: float,
-                 lapse_date: Optional[str] = None, lapse_quantity: Optional[int] = None):
+                 lapse_date: Optional[str] = None, lapse_quantity: Optional[int] = None,
+                 symbol: Optional[str] = None):
         self.award_date = award_date
         self.award_id = award_id
         self.fmv = fmv
@@ -23,6 +24,7 @@ class EquityGrant:
         self.taxes = taxes
         self.lapse_date = lapse_date
         self.lapse_quantity = lapse_quantity
+        self.symbol = symbol
 
 class Transaction:
     def __init__(self, date: str, action: str, symbol: str, quantity: str, amount: str, 
@@ -84,6 +86,7 @@ def load_equity_data(filename: str) -> List[EquityGrant]:
     
     current_lapse_date = None
     current_lapse_quantity = None
+    current_symbol = None
     
     for _, row in df.iterrows():
         # Skip Journal entries
@@ -94,6 +97,7 @@ def load_equity_data(filename: str) -> List[EquityGrant]:
         if pd.notna(row['Date']) and pd.notna(row['Action']) and row['Action'] == 'Lapse':
             current_lapse_date = row['Date']
             current_lapse_quantity = int(float(str(row['Quantity']).replace(',', ''))) if pd.notna(row['Quantity']) else None
+            current_symbol = row['Symbol'] if pd.notna(row['Symbol']) else None
         elif pd.notna(row['AwardId']) and current_lapse_date and current_lapse_quantity:
             grant = EquityGrant(
                 award_date=row['AwardDate'],
@@ -104,12 +108,14 @@ def load_equity_data(filename: str) -> List[EquityGrant]:
                 net_shares=int(float(str(row['NetSharesDeposited']).replace(',', ''))) if pd.notna(row['NetSharesDeposited']) else 0,
                 taxes=float(str(row['Taxes']).replace('$', '').replace(',', '')) if pd.notna(row['Taxes']) else 0.0,
                 lapse_date=current_lapse_date,
-                lapse_quantity=current_lapse_quantity
+                lapse_quantity=current_lapse_quantity,
+                symbol=current_symbol
             )
             grants.append(grant)
             
             current_lapse_date = None
             current_lapse_quantity = None
+            current_symbol = None
     
     return grants
 
@@ -346,7 +352,7 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
             operations.append(Operation(
                 date=lapse_date,
                 action='BUY',
-                symbol='RSU',
+                symbol=grant.symbol or 'RSU',
                 quantity=total_shares,
                 price=grant.fmv / exchange_rate
             ))
@@ -357,7 +363,7 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
             operations.append(Operation(
                 date=trans.date,
                 action='SELL',
-                symbol='RSU',
+                symbol=trans.symbol,
                 quantity=trans.quantity,
                 price=trans.amount / trans.quantity
             ))
@@ -369,105 +375,136 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
 def write_year_report(year: int, operations: List[Operation], bnb_tracker: MatchingTracker, 
                      exchange_rates: pd.DataFrame, base_dir: str) -> MatchingTracker:
     """Создает отчет для конкретного налогового года и возвращает обновленное состояние трекера."""
-    report_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
+    txt_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.txt')
+    pdf_file = os.path.join(base_dir, f'tax_year_{year}_{year+1}_report.pdf')
     
     realized_gains = []
     
-    with open(report_file, 'w', encoding='utf-8') as f:
-        print(f"Capital Gains Tax Calculations for {year}-{year+1}", file=f)
-        
-        # Группируем операции по датам
-        operations_by_date = defaultdict(list)
-        for op in operations:
-            operations_by_date[op.date.date()].append(op)
-        
-        # Обрабатываем каждый день
-        for date in sorted(operations_by_date.keys()):
-            daily_ops = operations_by_date[date]
-            
-            # Сначала обрабатываем все покупки дня
-            buys = [op for op in daily_ops if op.action == 'BUY']
-            sells = [op for op in daily_ops if op.action == 'SELL']
-
-            # Добавляем покупки в BnB трекер
-            for buy in buys:
-                bnb_tracker.add_buy(buy)
-                realized_gains.append(RealizedGain(
-                    buy.date,
-                    buy.symbol,
-                    buy.quantity,
-                    0.0,
-                    buy.quantity * buy.price,
-                    'BUY'
-                ))
-            
-            # Обрабатываем продажи
-            for sell in sells:
-                # 1. Same-day и BnB matching
-                matching_gains = bnb_tracker.match_sale(sell)
-                realized_gains.extend(matching_gains)
-            
-            # Печатаем состояние пула и операции дня
-            print_daily_summary(f, date, daily_ops, bnb_tracker, realized_gains)
-        
-        # Печатаем итоговое саммари
-        print_year_summary(f, realized_gains)
+    doc = SimpleDocTemplate(pdf_file, pagesize=A4)
+    styles = getSampleStyleSheet()
+    elements = []
     
-    return bnb_tracker
-
-def print_daily_summary(f, date: datetime, operations: List[Operation], tracker: MatchingTracker, 
-                       realized_gains: List[RealizedGain]):
-    """Prints daily summary of operations"""
-    formatted_date = date.strftime("%d %B %Y")
-    print(f"\nDate: {formatted_date}", file=f)
-    print("-" * 50, file=f)
+    content = []
+    content.append(f"Capital Gains Tax Calculations for {year}-{year+1}\n")
+    elements.append(Paragraph(content[-1], styles['Title']))
+    elements.append(Spacer(1, 20))
     
-    # Print operations
+    operations_by_date = defaultdict(list)
     for op in operations:
-        print(f"{op.action}: {op.quantity} shares at £{op.price:.2f}", file=f)
+        operations_by_date[op.date.date()].append(op)
     
-    # Проверяем, использовался ли Section 104 в этот день
-    daily_section104_gains = [g for g in realized_gains 
-                            if g.date.date() == date and g.action == 'SECTION_104']
-    
-    # Print Section 104 pool status только если он использовался
-    if daily_section104_gains:
-        remaining_buys = [b for b in tracker.buys if b.quantity > 0]
-        total_shares = sum(b.quantity for b in remaining_buys)
-        total_cost = sum(b.quantity * b.price for b in remaining_buys)
-        cost_basis_per_unit = total_cost / total_shares if total_shares else 0.0
+    for date in sorted(operations_by_date.keys()):
+        daily_ops = operations_by_date[date]
         
-        print(f"\nSection 104 Pool Status:", file=f)
-        print(f"Total shares: {total_shares}", file=f)
-        print(f"Cost basis per unit: £{cost_basis_per_unit:.2f}", file=f)
-        print(f"Total cost: £{total_cost:.2f}", file=f)
-    
-    # Print only SELL realized gains/losses for the day
-    daily_gains = [g for g in realized_gains if g.date.date() == date and g.action != 'BUY']
-    if daily_gains:
-        print("\nRealized Gains/Losses:", file=f)
-        for gain in daily_gains:
-            cost_basis_per_unit = gain.cost / gain.quantity if gain.quantity else 0
-            print(f"{gain.action}: {gain.quantity} shares, "
-                  f"proceeds: £{gain.proceeds:.2f}, "
-                  f"cost basis per unit: £{cost_basis_per_unit:.2f}, "
-                  f"cost: £{gain.cost:.2f}, "
-                  f"gain/loss: £{gain.gain:.2f}", file=f)
+        buys = [op for op in daily_ops if op.action == 'BUY']
+        sells = [op for op in daily_ops if op.action == 'SELL']
 
-def print_year_summary(f, realized_gains: List[RealizedGain]):
-    """Prints yearly summary"""
+        # Обработка операций
+        for buy in buys:
+            bnb_tracker.add_buy(buy)
+            realized_gains.append(RealizedGain(
+                buy.date, buy.symbol, buy.quantity, 0.0,
+                buy.quantity * buy.price, 'Acquisition'
+            ))
+        
+        for sell in sells:
+            matching_gains = bnb_tracker.match_sale(sell)
+            realized_gains.extend(matching_gains)
+        
+        # Форматирование вывода
+        formatted_date = date.strftime("%d %B %Y")
+        content.append(f"\n{formatted_date}")
+        
+        elements.append(Paragraph(f"Date: {formatted_date}", styles['Heading2']))
+        elements.append(Spacer(1, 10))
+        
+        # Группировка операций по символу и цене
+        buys_by_symbol_price = defaultdict(lambda: defaultdict(int))
+        sells_by_symbol_price = defaultdict(lambda: defaultdict(int))
+        
+        for op in buys:
+            buys_by_symbol_price[op.symbol][op.price] += op.quantity
+            
+        for op in sells:
+            sells_by_symbol_price[op.symbol][op.price] += op.quantity
+        
+        # Вывод сгруппированных операций
+        for symbol, price_qty in buys_by_symbol_price.items():
+            for price, quantity in price_qty.items():
+                line = f"Acquisition: {quantity} shares of {symbol} at £{price:.2f}"
+                content.append(line)
+                elements.append(Paragraph(line, styles['Normal']))
+            
+        for symbol, price_qty in sells_by_symbol_price.items():
+            for price, quantity in price_qty.items():
+                line = f"Sell: {quantity} shares of {symbol} at £{price:.2f}"
+                content.append(line)
+                elements.append(Paragraph(line, styles['Normal']))
+        
+        daily_section104_gains = [g for g in realized_gains 
+                                if g.date.date() == date and g.action == 'SECTION_104']
+        
+        if daily_section104_gains:
+            remaining_buys = [b for b in bnb_tracker.buys if b.quantity > 0]
+            total_shares = sum(b.quantity for b in remaining_buys)
+            total_cost = sum(b.quantity * b.price for b in remaining_buys)
+            cost_basis_per_unit = total_cost / total_shares if total_shares else 0.0
+            
+            content.append("\nSection 104 Pool Status:")
+            content.append(f"Total shares: {total_shares}")
+            content.append(f"Cost basis per unit: £{cost_basis_per_unit:.2f}")
+            content.append(f"Total cost: £{total_cost:.2f}")
+            
+            elements.append(Spacer(1, 15))
+            for line in content[-4:]:
+                elements.append(Paragraph(line, styles['Normal']))
+        
+        daily_gains = [g for g in realized_gains if g.date.date() == date and g.action != 'Acquisition']
+        if daily_gains:
+            content.append("\nRealized Gains/Losses:")
+            elements.append(Spacer(1, 15))
+            elements.append(Paragraph("Realized Gains/Losses:", styles['Normal']))
+            
+            for gain in daily_gains:
+                cost_basis_per_unit = gain.cost / gain.quantity if gain.quantity else 0
+                action = "Bed and Breakfast" if gain.action == 'BED_AND_BREAKFAST' else gain.action
+                line = (f"{action}: {gain.quantity} shares, "
+                       f"proceeds: £{gain.proceeds:.2f}, "
+                       f"cost basis per unit: £{cost_basis_per_unit:.2f}, "
+                       f"cost: £{gain.cost:.2f}, "
+                       f"gain/loss: £{gain.gain:.2f}")
+                content.append(line)
+                elements.append(Paragraph(line, styles['Normal']))
+        
+        elements.append(Spacer(1, 20))
+    
     summary = create_summary(realized_gains)
     
-    print("\n" + "=" * 50, file=f)
-    print("YEARLY SUMMARY", file=f)
-    print("=" * 50, file=f)
-    print(f"Number of acquisitions: {summary['acquisitions']}", file=f)
-    print(f"Number of disposals: {summary['disposals']}", file=f)
-    print(f"Total proceeds: £{summary['total_proceeds']:.2f}", file=f)
-    print(f"Total gains: £{summary['total_gains']:.2f}", file=f)
-    print(f"Total losses: £{summary['total_losses']:.2f}", file=f)
-    print(f"Net gain/loss: £{summary['net_gain']:.2f}", file=f)
-    print("=" * 50, file=f)
+    summary_lines = [
+        "\n" + "=" * 50,
+        "YEARLY SUMMARY",
+        "=" * 50,
+        f"Number of acquisitions: {summary['acquisitions']}",
+        f"Number of disposals: {summary['disposals']}",
+        f"Total proceeds: £{summary['total_proceeds']:.2f}",
+        f"Total gains: £{summary['total_gains']:.2f}",
+        f"Total losses: £{summary['total_losses']:.2f}",
+        f"Net gain/loss: £{summary['net_gain']:.2f}",
+        "=" * 50 + "\n"
+    ]
+    
+    content.extend(summary_lines)
+    
+    elements.append(Spacer(1, 30))
+    for line in summary_lines:
+        elements.append(Paragraph(line, styles['Normal']))
+    
+    with open(txt_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(content))
+    
+    doc.build(elements)
+    
+    return bnb_tracker
 
 def build_report(history_file: str, equity_file: str, exchange_rates_file: str):
     """Создает отчет по транзакциям акций."""
