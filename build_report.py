@@ -168,25 +168,6 @@ def load_transactions(filename: str, equity_data: List[EquityGrant], exchange_ra
     
     return transactions
 
-class Section104Pool:
-    def __init__(self):
-        self.total_shares = 0
-        self.total_cost = 0.0
-    
-    @property
-    def average_price(self):
-        return self.total_cost / self.total_shares if self.total_shares else 0.0
-    
-    def add_shares(self, quantity, price):
-        self.total_shares += quantity
-        self.total_cost += quantity * price
-    
-    def remove_shares(self, quantity):
-        avg = self.average_price
-        self.total_shares -= quantity
-        self.total_cost -= quantity * avg
-        return avg
-
 class Operation:
     def __init__(self, date: datetime, action: str, symbol: str, quantity: int, price: float):
         self.date = date
