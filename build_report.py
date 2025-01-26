@@ -48,20 +48,7 @@ class Transaction:
 
     def _get_exchange_rate(self, exchange_rates: pd.DataFrame) -> float:
         """Get the exchange rate for the transaction date's month"""
-        # Находим все курсы для нужного месяца и года
-        month_rates = exchange_rates[
-            (exchange_rates.index.year == self.date.year) & 
-            (exchange_rates.index.month == self.date.month)
-        ]
-        
-        if month_rates.empty:
-            raise ValueError(
-                f"Не найден курс обмена для {self.date.strftime('%B %Y')}. "
-                f"Убедитесь, что файл exchange_rates.csv содержит данные для этого периода."
-            )
-            
-        # Берем первый курс за месяц
-        return month_rates.iloc[0]['gbp_usd_rate']
+        return get_exchange_rate_for_date(self.date, exchange_rates)
 
     def __str__(self):
         base_str = (
@@ -215,11 +202,9 @@ class RealizedGain:
 class MatchingTracker:
     def __init__(self):
         self.buys = deque()  # очередь всех покупок
-        self.section_104_pool = Section104Pool()
 
     def add_buy(self, buy: Operation):
         self.buys.append(buy)
-        self.section_104_pool.add_shares(buy.quantity, buy.price)
 
     def match_sale(self, sell: Operation) -> List[RealizedGain]:
         realized_gains = []
@@ -232,7 +217,7 @@ class MatchingTracker:
         )
         realized_gains.extend(same_day_gains)
 
-        # 2. Bed and Breakfast matching (в течение 30 дней)
+        # 2. Bed and Breakfast matching
         if remaining_quantity > 0:
             cutoff_date = sell.date - timedelta(days=30)
             bnb_buys = [b for b in self.buys 
@@ -242,9 +227,19 @@ class MatchingTracker:
             )
             realized_gains.extend(bnb_gains)
 
-        # 3. Section 104 для оставшегося количества
+        # 3. Section 104 для оставшихся акций
         if remaining_quantity > 0:
-            avg_price = self.section_104_pool.remove_shares(remaining_quantity)
+            # Рассчитываем среднюю цену по оставшимся покупкам
+            remaining_buys = [b for b in self.buys if b.quantity > 0]
+            total_shares = sum(b.quantity for b in remaining_buys)
+            total_cost = sum(b.quantity * b.price for b in remaining_buys)
+            avg_price = total_cost / total_shares if total_shares else 0.0
+
+            # Уменьшаем количество акций пропорционально
+            for buy in remaining_buys:
+                reduction = (buy.quantity * remaining_quantity) / total_shares
+                buy.quantity -= reduction
+
             realized_gains.append(RealizedGain(
                 date=sell.date,
                 symbol=sell.symbol,
@@ -282,9 +277,6 @@ class MatchingTracker:
             remaining -= match_quantity
             buy.quantity -= match_quantity
             
-            # Корректируем Section 104 pool
-            self.section_104_pool.remove_shares(match_quantity)
-
         return remaining, realized_gains
 
 def get_uk_tax_year(date: datetime) -> int:
@@ -320,11 +312,26 @@ def create_summary(realized_gains: List[RealizedGain]) -> dict:
         'net_gain': total_gains - total_losses
     }
 
+def get_exchange_rate_for_date(date: datetime, exchange_rates: pd.DataFrame) -> float:
+    """Get the exchange rate for the given date's month"""
+    month_rates = exchange_rates[
+        (exchange_rates.index.year == date.year) & 
+        (exchange_rates.index.month == date.month)
+    ]
+    
+    if month_rates.empty:
+        raise ValueError(
+            f"Не найден курс обмена для {date.strftime('%B %Y')}. "
+            f"Убедитесь, что файл exchange_rates.csv содержит данные для этого периода."
+        )
+        
+    return month_rates.iloc[0]['gbp_usd_rate']
+
 def process_transactions_chronologically(history_file: str, equity_file: str, 
                                       exchange_rates_file: str) -> List[Operation]:
     """Обрабатывает транзакции и гранты хронологически и возвращает список операций."""
-    equity_data = load_equity_data(equity_file)
     exchange_rates = load_exchange_rates(exchange_rates_file)
+    equity_data = load_equity_data(equity_file)
     transactions = load_transactions(history_file, equity_data, exchange_rates)
     
     operations = []
@@ -334,8 +341,7 @@ def process_transactions_chronologically(history_file: str, equity_file: str,
         if grant.lapse_date:
             lapse_date = pd.to_datetime(grant.lapse_date)
             total_shares = grant.net_shares + grant.shares_sold_for_taxes
-            closest_date = exchange_rates.index[exchange_rates.index <= lapse_date].max()
-            exchange_rate = exchange_rates.loc[closest_date, 'gbp_usd_rate']
+            exchange_rate = get_exchange_rate_for_date(lapse_date, exchange_rates)
             
             operations.append(Operation(
                 date=lapse_date,
@@ -402,14 +408,14 @@ def write_year_report(year: int, operations: List[Operation], bnb_tracker: Match
                 realized_gains.extend(matching_gains)
             
             # Печатаем состояние пула и операции дня
-            print_daily_summary(f, date, daily_ops, bnb_tracker.section_104_pool, realized_gains)
+            print_daily_summary(f, date, daily_ops, bnb_tracker, realized_gains)
         
         # Печатаем итоговое саммари
         print_year_summary(f, realized_gains)
     
     return bnb_tracker
 
-def print_daily_summary(f, date: datetime, operations: List[Operation], pool: Section104Pool, 
+def print_daily_summary(f, date: datetime, operations: List[Operation], tracker: MatchingTracker, 
                        realized_gains: List[RealizedGain]):
     """Prints daily summary of operations"""
     formatted_date = date.strftime("%d %B %Y")
@@ -420,19 +426,31 @@ def print_daily_summary(f, date: datetime, operations: List[Operation], pool: Se
     for op in operations:
         print(f"{op.action}: {op.quantity} shares at £{op.price:.2f}", file=f)
     
-    # Print Section 104 pool status
-    print(f"\nSection 104 Pool Status:", file=f)
-    print(f"Total shares: {pool.total_shares}", file=f)
-    print(f"Average price: £{pool.average_price:.2f}", file=f)
-    print(f"Total cost: £{pool.total_cost:.2f}", file=f)
+    # Проверяем, использовался ли Section 104 в этот день
+    daily_section104_gains = [g for g in realized_gains 
+                            if g.date.date() == date and g.action == 'SECTION_104']
+    
+    # Print Section 104 pool status только если он использовался
+    if daily_section104_gains:
+        remaining_buys = [b for b in tracker.buys if b.quantity > 0]
+        total_shares = sum(b.quantity for b in remaining_buys)
+        total_cost = sum(b.quantity * b.price for b in remaining_buys)
+        cost_basis_per_unit = total_cost / total_shares if total_shares else 0.0
+        
+        print(f"\nSection 104 Pool Status:", file=f)
+        print(f"Total shares: {total_shares}", file=f)
+        print(f"Cost basis per unit: £{cost_basis_per_unit:.2f}", file=f)
+        print(f"Total cost: £{total_cost:.2f}", file=f)
     
     # Print only SELL realized gains/losses for the day
     daily_gains = [g for g in realized_gains if g.date.date() == date and g.action != 'BUY']
     if daily_gains:
         print("\nRealized Gains/Losses:", file=f)
         for gain in daily_gains:
+            cost_basis_per_unit = gain.cost / gain.quantity if gain.quantity else 0
             print(f"{gain.action}: {gain.quantity} shares, "
                   f"proceeds: £{gain.proceeds:.2f}, "
+                  f"cost basis per unit: £{cost_basis_per_unit:.2f}, "
                   f"cost: £{gain.cost:.2f}, "
                   f"gain/loss: £{gain.gain:.2f}", file=f)
 
